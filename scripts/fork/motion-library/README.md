@@ -41,14 +41,23 @@ EffectCraft anywhere ──► local cache by content hash (~/Library/Caches/Eff
 | `library.card {id}` | a card with its files and placeholders |
 | `library.apply {id, comp?, time?, wait?}` | download + import + nest at the playhead, one undo step; `needsFootage` lists items to relink |
 | `library.configure {remote?, token?, cache?}` | writes `motion-library.json` in the settings folder |
-| `library.publish {library, folders?, maxFileMB?, includeVideo?, dryRun?, force?}` | desktop: publish |
+| `library.publish {library, folders?, maxFileMB?, includeVideo?, catalogAll?, dryRun?, force?}` | desktop: publish |
 
 The panel's view is the UI command `motionLibrary.view {folder?, query?, scale?, cardSize?, expand?,
-collapse?, display?}` (interface scale 80–140 %, card size 88–1200, as the web panel's Display
+collapse?, kind?, hereOnly?, showFolders?, showTools?, popover?, details?}` (interface scale 80–140 %, card size 88–1200, as the web panel's Display
 settings). The manifest carries the web panel's collection order and icons (`collections`), each
 card's type label and location (`Comp · Devin Jatho/UI`) and thumbnail size; videos without a
-thumbnail get a poster of their middle frame (`effectcraft/posters/`, made by
+thumbnail get a poster of their middle frame (`catalogAll` / `--catalog-all`, the Mac script's default:
+every other library entry is listed too, thumbnail only, badged **on the Mac** and never applied
+here; `library.search` leaves those out) (`effectcraft/posters/`, made by
 `poster.swift` next to the exporter).
+
+The panel has the web panel's left rail (Assets, Curves, Search, Filters, Collections, SFX, Tools,
+the label strip → `edit.label`, the library state dot, refresh, Display settings, + Save), card
+details (ⓘ), drag a card onto the Timeline or the viewer (`motionLibrary.apply {id, time?}`), and
+the quick actions on the right, each an engine command: `layer.smartPrecompose`,
+`layer.decompose`, `layer.multiPrecompose`, `project.deepDuplicate`, `layer.splitMasks`,
+`shape.gradientLock` (and `keys.easyEase`).
 
 Search ranks cards like the Python panel (`retrieval.py`; parity test in
 `crates/motionlib/src/search.rs`).

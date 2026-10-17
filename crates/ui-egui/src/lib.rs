@@ -1572,6 +1572,14 @@ impl EffectcraftApp {
         self.request_frame_with(comp, frame, scale, true);
     }
 
+    /// Request the paused viewer's frame: also over a draft of the cloud's stream (CR6c).
+    pub fn request_frame_exact(&self, comp: ItemId, frame: i64, scale: f64) {
+        let Some(c) = self.session.project.comp(comp) else { return };
+        let key = self.frame_key(comp, frame, scale);
+        let opts = self.frame_opts(comp, scale);
+        self.frames.request_exact(&self.render_source(), key, comp, c.frame_rate.tick_of(frame), opts);
+    }
+
     /// Render options of viewer frames of `comp` at `scale`.
     pub fn frame_opts(&self, comp: ItemId, scale: f64) -> RenderOpts {
         let (draft, _) = self.session.state.viewer.fast_previews.render(self.ui.viewer.interacting || self.ui.viewer.property_interacting);
@@ -1719,9 +1727,9 @@ impl EffectcraftApp {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.frames.set_playhead(None);
         #[cfg(not(target_arch = "wasm32"))]
-        if self.cloud_play.active() {
+        {
             let shown = self.viewer_shown.as_ref().map(|(_, k)| *k);
-            self.cloud_play.halt(&self.frames, shown);
+            self.cloud_play.stop(&self.frames, shown, self.session.revision);
         }
         self.audio = None;
         self.playback.caching = false;
@@ -2141,6 +2149,7 @@ impl EffectcraftApp {
             looping: plan.is_some_and(|p| p.looping),
             waiting: self.playback.waiting,
             fit: self.frames_that_fit(c, scale),
+            disk: self.session.disk_cache.clone(),
         };
         let client = self.cloud.client().cloned();
         let t = self.cloud_play.tick(client.as_ref(), &p, &self.frames, Some(ctx));

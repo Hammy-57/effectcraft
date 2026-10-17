@@ -184,7 +184,7 @@ unsubscribes.
 | `observationTimeSeconds` | Current egui clock time in seconds; use differences within this app session, not as a wall-clock timestamp. |
 | `lastShownTimeSeconds`, `lastShownAgeSeconds` | Last recorded playback frame-advance time on the same clock and its nonnegative age at inspection; both are null before an observation. |
 | `intervals` | Since the preview started: frames `shown` and `skipped`, `p50Ms`/`p95Ms`/`p99Ms`/`maxMs` between frames shown, `seconds`. |
-| `stream` | CR6b, a cloud preview playing from the server's playback stream (the running stream, else the last one; null before any): `state` (`starting`/`playing`/`ended`/`stopped`/`failed`, `error`), `warmupMs` (start request → first chunk decoded), `chunks`, `upgrades` (full-size copies of frames it had smaller), `late` (chunks decoded after playback reached them), `stallMs`/`stalls` (playback waiting after the warm-up), `bytes`, `kbps`, `decodeMs` (per frame, smoothed), first copies by resolution `full`/`half`/`quarter`, `stale` (edits while playing), `broken`, `size`. |
+| `stream` | CR6b, a cloud preview playing from the server's playback stream (the running stream, else the last one; null before any): `state` (`starting`/`playing`/`ended`/`stopped`/`failed`, `error`), `warmupMs` (start request → first chunk decoded), `chunks`, `upgrades` (full-size copies of frames it had smaller), `late` (chunks decoded after playback reached them), `stallMs`/`stalls` (playback waiting after the warm-up), `bytes`, `kbps`, `decodeMs` (per frame, smoothed), first copies by resolution `full`/`half`/`quarter`, `stale` (edits while playing), `broken`, `size`; for the preview (CR6c): `held` (frames ahead found on this Mac, not streamed), `fromDisk` (read back from the disk cache), `streams` (one per run of missing frames), `toDisk` (written to the disk cache). |
 
 The rate window is pruned only when another frame advance is recorded, so the diagnostic rate can
 remain stale during a stall. Inspect its age and `waiting`, and sample `time`/`frame` over known
@@ -447,9 +447,12 @@ Chunks decode on two threads into the RAM preview cache under the viewer's frame
 quarter chunks too, scaled up in the viewer; the newest copy of a frame wins), and playback runs
 as for local frames: it waits at a missing frame and the sound follows its clock. Nothing renders
 or is asked for on the Mac meanwhile. Edits go as patches; after `stale`, the old frames keep
-playing until the new revision's arrive. Stop, pause or a seek send `stop`/`seek`; stopping takes
-the stream's low-resolution and stale frames (and the frame on screen) out of the cache, so the
-paused viewer gets its exact frame. A `failed` stream or a lost connection ends it: the preview
+playing until the new revision's arrive. Stop or pause sends `stop`. CR6c: the stream's frames stay on
+this Mac when it stops: below-full-size ones as *drafts* (lighter green on the cache bar; the
+paused viewer renders the exact frame on screen over one), only stale ones are taken out; current
+frames also go to this Mac's disk cache (keys at the size they came, never found as rendered
+frames). A stream plays one run of frames this Mac doesn't hold (RAM, disk), so a replay, also
+after a restart, downloads nothing it has; a seek plans again from the new frame. A `failed` stream or a lost connection ends it: the preview
 goes on rendering on the Mac with a status note. `EFFECTCRAFT_CLOUD_STREAM=0` turns the stream off
 (CR5's frame requests then). `ui.inspect.preview.stream` has its numbers.
 ## Render box

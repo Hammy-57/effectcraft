@@ -11,9 +11,13 @@
 //! clock as for local frames.
 //!
 //! - **Adaptive resolution.** A chunk may come at half or quarter size while the lead is short;
-//!   it is cached under the viewer's key all the same (the viewer scales it up) and replaced
-//!   when the full-size copy comes. Low-resolution and stale frames are taken out of the cache
-//!   when the preview stops, so the paused viewer shows a full frame (CR5's path).
+//!   it is cached under the viewer's key all the same (the viewer scales it up) as a *draft*
+//!   ([`crate::frames::streamed`]) and replaced when the full-size copy comes.
+//! - **Kept on this Mac (CR6c).** When the preview stops, its frames stay in the RAM preview
+//!   (drafts too; only stale ones go) and every current frame is written to this Mac's disk
+//!   cache. Playing again only streams the frames this Mac doesn't hold: a stream plays one run
+//!   of missing frames, and the frames on disk are read back on a thread of their own. The
+//!   paused viewer still renders the exact frame on screen (CR5's path).
 //! - **Edits while playing.** The edit goes to the server as a patch; it answers
 //!   [`StreamReply::Stale`] from the first frame the edit can change. Frames from there on keep
 //!   playing (marked stale) until the new revision's replace them, rather than holding playback
@@ -33,8 +37,23 @@ use effectcraft_engine::render::RenderOpts;
 use effectcraft_engine::time::{FrameRate, Tick};
 use serde::Serialize;
 
+use effectcraft_engine::render::disk_cache::DiskCache;
+
 use crate::cloud::CloudFrames;
-use crate::frames::{FrameKey, Frames};
+use crate::frames::streamed::{StreamedSink, is_draft_scale, read_back};
+use crate::frames::{FrameKey, Frames, opts_hash};
+
+/// A frame [`StreamBuffer::publish`] puts in the RAM cache.
+pub struct Published {
+    pub key: FrameKey,
+    pub img: Arc<egui::ColorImage>,
+    /// Its size relative to the viewer's.
+    pub scale: f32,
+    /// Cached as a draft: below full size, stale, or of an older revision than the key's.
+    pub draft: bool,
+    /// Rendered at the key's revision and not stale: it goes to the disk cache.
+    pub current: bool,
+}
 
 /// Frames per chunk asked for (≈ 0.5 s at 29.97 fps).
 pub const CHUNK_FRAMES: u32 = effectcraft_engine::remote_stream::DEFAULT_CHUNK_FRAMES;
@@ -90,6 +109,13 @@ pub struct StreamStats {
     pub broken: u64,
     /// Full size of the stream's frames.
     pub size: Option<[u32; 2]>,
+    /// CR6c, this preview: frames it found on this Mac (RAM or disk) instead of streaming them,
+    /// of those read back from the disk cache, streams started (one per run of missing frames),
+    /// and frames written to the disk cache.
+    pub held: u64,
+    pub from_disk: u64,
+    pub streams: u64,
+    pub to_disk: u64,
 }
 
 /// A decoded frame held for playback.
@@ -109,9 +135,10 @@ pub struct StreamBuffer {
     frames: BTreeMap<i64, Held>,
     /// `stale` notices: (revision, first frame): older revisions' frames from there on are old.
     notices: Vec<(u64, i64)>,
-    /// Keys this stream put in the cache that are below full size or stale: taken out again when
-    /// the preview stops.
+    /// Keys this stream put in the cache that are stale: taken out again when the preview stops.
     dirty: HashSet<FrameKey>,
+    /// The newest revision a chunk or a `stale` notice came at.
+    acked: u64,
     /// Playback's frame and range (see [`StreamBuffer::set_playhead`]).
     cur: i64,
     range: (i64, i64, bool),
@@ -131,6 +158,7 @@ impl StreamBuffer {
             frames: BTreeMap::new(),
             notices: vec![],
             dirty: HashSet::new(),
+            acked: 0,
             cur,
             range,
             cap: cap.max(1),
@@ -172,6 +200,11 @@ impl StreamBuffer {
         self.frames.get(&f).is_some_and(|h| !h.stale)
     }
 
+    /// Whether the frame is held and an edit made it old.
+    pub fn stale(&self, f: i64) -> bool {
+        self.frames.get(&f).is_some_and(|h| h.stale)
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
@@ -202,6 +235,7 @@ impl StreamBuffer {
             // Playback reached it before it was here.
             self.stats.late = self.stats.late.saturating_add(1);
         }
+        self.acked = self.acked.max(meta.revision);
         if !imgs.is_empty() {
             let per = decode_ms / imgs.len() as f64;
             self.stats.decode_ms = Some(self.stats.decode_ms.map_or(per, |o| o * 0.75 + per * 0.25));
@@ -243,6 +277,7 @@ impl StreamBuffer {
     /// An edit at `revision` changed the frames from `from` on.
     pub fn mark_stale(&mut self, revision: u64, from: i64) {
         self.stats.stale = self.stats.stale.saturating_add(1);
+        self.acked = self.acked.max(revision);
         self.notices.push((revision, from));
         if self.notices.len() > 64 {
             self.notices.remove(0);
@@ -259,7 +294,7 @@ impl StreamBuffer {
 
     /// The frames to put in the RAM cache under `series` (with its frame set): new ones, and
     /// every one again when the series changed (an edit gives the comp a new content key).
-    pub fn publish(&mut self, series: &FrameKey) -> Vec<(FrameKey, Arc<egui::ColorImage>)> {
+    pub fn publish(&mut self, series: &FrameKey) -> Vec<Published> {
         let mut out = vec![];
         for (f, h) in &mut self.frames {
             let key = FrameKey { frame: *f, ..*series };
@@ -267,19 +302,28 @@ impl StreamBuffer {
                 continue;
             }
             h.published = Some(key);
-            if h.stale || h.scale < 0.99 {
+            if h.stale {
                 self.dirty.insert(key);
             } else {
                 self.dirty.remove(&key);
             }
-            out.push((key, h.img.clone()));
+            // Only a frame rendered at the series' revision is known to show it (a frame of an
+            // older one shows until the server's `stale` notice says whether the edit changed it).
+            let current = h.revision >= series.revision && !h.stale;
+            out.push(Published { key, img: h.img.clone(), scale: h.scale, draft: h.stale || is_draft_scale(h.scale) || !current, current });
         }
         out
     }
 
-    /// The keys to take out of the cache when the preview stops (below full size, stale).
-    pub fn take_dirty(&mut self) -> Vec<FrameKey> {
-        self.dirty.drain().collect()
+    /// The keys to take out of the cache when the preview stops: stale frames, and frames of
+    /// revisions before `revision` while the server hasn't answered the edit yet (it may change
+    /// them). Below-full-size frames stay (drafts).
+    pub fn take_dirty(&mut self, revision: u64) -> Vec<FrameKey> {
+        let mut out: Vec<FrameKey> = self.dirty.drain().collect();
+        if self.acked < revision {
+            out.extend(self.frames.values().filter(|h| h.revision < revision).filter_map(|h| h.published));
+        }
+        out
     }
 
     pub fn fail(&mut self, error: String) {
@@ -403,6 +447,8 @@ pub struct PlayNow<'a> {
     pub waiting: bool,
     /// How many viewer frames the RAM preview holds.
     pub fit: i64,
+    /// This Mac's disk cache: streamed frames are kept there and read back from it.
+    pub disk: Option<Arc<DiskCache>>,
 }
 
 /// What the app does with this UI frame's playback.
@@ -414,34 +460,142 @@ pub struct PlayTick {
     pub note: Option<String>,
 }
 
-/// The app's side of the playback stream: start it when a cloud preview plays, feed it the
-/// playhead and edits, publish its frames, stop it and clean up.
+/// How long a preview waits for its comp's content key before streaming frames the disk cache
+/// may hold (seconds; it is hashed on a worker).
+const KEY_WAIT: f64 = 0.5;
+
+/// The app's side of the playback stream: start it when a cloud preview plays (for the frames
+/// this Mac doesn't hold), feed it the playhead and edits, publish its frames, stop it and clean
+/// up.
 #[derive(Default)]
 pub struct CloudPlayback {
     current: Option<Running>,
+    /// The playing preview (across the streams it starts).
+    preview: Option<Preview>,
     /// This preview gave up on the stream (it failed): it plays on here until the next one.
     given_up: bool,
     /// The last stream's numbers (kept after it stops, for `ui.inspect`).
     pub last: Option<StreamStats>,
 }
 
+/// One stream: it plays the run of missing frames `run` (inclusive).
 struct Running {
     shared: Arc<StreamShared>,
     client: Arc<CloudFrames>,
     revision: u64,
+    run: (i64, i64),
+}
+
+/// A playing preview.
+struct Preview {
+    started: f64,
     cur: i64,
     range: (i64, i64, bool),
     playhead_at: f64,
     seen: f64,
     stalled: bool,
+    /// Frames read back from the disk cache.
+    loader: Option<Loader>,
+    held: u64,
+    streams: u64,
+    to_disk: u64,
+}
+
+/// Reads a preview's frames back from the disk cache into the RAM preview, in play order.
+struct Loader {
+    series: FrameKey,
+    /// Frames still to read (held: no stream asks for them).
+    pending: Arc<Mutex<HashSet<i64>>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    loaded: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Loader {
+    fn start(dc: Arc<DiskCache>, sink: StreamedSink, series: FrameKey, jobs: Vec<(i64, u128, bool)>) -> Loader {
+        let pending: Arc<Mutex<HashSet<i64>>> = Arc::new(Mutex::new(jobs.iter().map(|j| j.0).collect()));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (p, c, l) = (pending.clone(), cancel.clone(), loaded.clone());
+        let run = move || {
+            for (f, k, draft) in jobs {
+                if c.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                // A damaged entry is only a frame the stream asks for.
+                if let Ok(Some(img)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_back(&dc, k))) {
+                    sink.insert(FrameKey { frame: f, ..series }, img, draft);
+                    l.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                p.lock().unwrap_or_else(PoisonError::into_inner).remove(&f);
+            }
+            p.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        };
+        if let Err(e) = std::thread::Builder::new().name("ec-stream-disk".into()).spawn(run) {
+            log::warn!("cloud stream: no disk reader: {e}");
+            pending.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        }
+        Loader { series, pending, cancel, loaded }
+    }
+
+    fn pending(&self, f: i64) -> bool {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).contains(&f)
+    }
+}
+
+/// The preview's frames from `cur` in play order, as many as `fit` (each once).
+fn play_order(cur: i64, (start, end, looping): (i64, i64, bool), fit: i64) -> Vec<i64> {
+    let n = end.saturating_sub(start).saturating_add(1).clamp(0, fit.clamp(0, 100_000));
+    let cur = cur.clamp(start, end.max(start));
+    (0..n)
+        .map_while(|k| {
+            let f = cur.saturating_add(k);
+            if f <= end {
+                Some(f)
+            } else if looping {
+                Some(start.saturating_add(f.saturating_sub(end).saturating_sub(1)))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The first run of frames in `order` that `held` says this Mac doesn't hold: its first and last
+/// frame (consecutive frames, inclusive).
+pub fn missing_run(order: &[i64], held: impl Fn(i64) -> bool) -> Option<(i64, i64)> {
+    let i = order.iter().position(|f| !held(*f))?;
+    let a = *order.get(i)?;
+    let mut b = a;
+    for f in order.iter().skip(i.saturating_add(1)) {
+        if *f != b.saturating_add(1) || held(*f) {
+            break;
+        }
+        b = *f;
+    }
+    Some((a, b))
 }
 
 impl CloudPlayback {
-    /// The running stream's numbers, else the last one's.
+    /// The running stream's numbers, else the last one's, with this preview's.
     pub fn stats(&self) -> Option<StreamStats> {
-        self.current.as_ref().map(|r| r.shared.buffer().stats.clone()).or_else(|| self.last.clone())
+        let mut s = self.current.as_ref().map(|r| r.shared.buffer().stats.clone()).or_else(|| self.last.clone());
+        if let Some(p) = &self.preview {
+            let s = s.get_or_insert_with(|| StreamStats { state: "held".into(), ..StreamStats::default() });
+            s.held = p.held;
+            s.streams = p.streams;
+            s.to_disk = p.to_disk;
+            s.from_disk = p.loader.as_ref().map_or(0, |l| l.loaded.load(std::sync::atomic::Ordering::Acquire));
+        }
+        s
     }
 
+    /// A stream runs.
     pub fn active(&self) -> bool {
         self.current.is_some()
     }
@@ -451,108 +605,225 @@ impl CloudPlayback {
         let client = client.filter(|c| c.ready());
         if !p.playing {
             self.given_up = false;
-            self.halt(frames, Some(FrameKey { frame: p.cur, ..p.series }));
+            self.halt(frames, Some(FrameKey { frame: p.cur, ..p.series }), p.revision);
+            self.end_preview();
             return PlayTick::default();
         }
         let Some(client) = client else {
             // The cloud went away mid-preview (its own note says so): frames render here.
-            self.halt(frames, None);
+            self.halt(frames, None, p.revision);
+            self.end_preview();
             return PlayTick::default();
         };
         if self.given_up {
             return PlayTick::default();
         }
         if self.current.as_ref().is_some_and(|r| !Arc::ptr_eq(&r.client, client)) {
-            self.halt(frames, None);
+            self.halt(frames, None, p.revision);
         }
         let range = (p.start, p.end, p.looping);
-        let Some(r) = &mut self.current else {
-            let cap = usize::try_from(p.fit.clamp(1, 100_000)).unwrap_or(1);
-            let ahead = AHEAD_SECS.min(((p.fit as f64 * 0.6) / p.rate.as_f64().max(1.0)) as f32).max(1.0);
-            let shared = StreamShared::new(StreamBuffer::new(p.cur, range, cap), p.rate, ctx.cloned());
-            let start = StreamStart {
-                project: p.project.clone(),
-                revision: p.revision,
-                comp: p.comp,
-                from: p.rate.tick_of(p.cur),
-                to: Some(p.rate.tick_of(p.end.saturating_add(1))),
-                loop_from: Some(p.rate.tick_of(p.start)),
-                looping: p.looping,
-                opts: p.opts,
-                ahead_secs: ahead,
-                cache: frames.cache_series(p.project, &p.series, &p.opts),
-            };
-            client.stream_start(start, shared.clone());
-            self.current =
-                Some(Running { shared, client: client.clone(), revision: p.revision, cur: p.cur, range, playhead_at: p.now, seen: p.now, stalled: false });
-            return PlayTick { streamed: true, note: None };
-        };
-        let failed = r.shared.buffer().failed.clone();
+        let pv = self.preview.get_or_insert_with(|| Preview {
+            started: p.now,
+            cur: p.cur,
+            range,
+            playhead_at: p.now,
+            seen: p.now,
+            stalled: false,
+            loader: None,
+            held: 0,
+            streams: 0,
+            to_disk: 0,
+        });
+        // A jump (the playhead moved by hand, the range changed): plan again from there.
+        let wrapped = p.looping && p.cur <= p.start.saturating_add(2) && pv.cur >= p.end.saturating_sub(2);
+        let jump = (p.cur < pv.cur && !wrapped) || p.cur > pv.cur.saturating_add((p.rate.as_f64() * 2.0) as i64).saturating_add(2) || range != pv.range;
+        pv.cur = p.cur;
+        pv.range = range;
+        if jump {
+            pv.loader = None;
+            self.halt(frames, None, p.revision);
+        }
+        let failed = self.current.as_ref().and_then(|r| r.shared.buffer().failed.clone());
         if let Some(e) = failed {
             self.given_up = true;
-            self.halt(frames, None);
+            self.halt(frames, None, p.revision);
             return PlayTick { streamed: false, note: Some(format!("Cloud playback stream stopped ({e}): playing on this Mac")) };
         }
-        // An edit: the server renders again from the first frame it changes.
-        if p.revision != r.revision {
-            r.revision = p.revision;
-            r.client.stream_sync(p.revision, p.project);
-        }
-        // A jump (the playhead moved by hand, the range changed): play from there.
-        let wrapped = p.looping && p.cur <= p.start.saturating_add(2) && r.cur >= p.end.saturating_sub(2);
-        let jump = (p.cur < r.cur && !wrapped) || p.cur > r.cur.saturating_add((p.rate.as_f64() * 2.0) as i64).saturating_add(2) || range != r.range;
-        if jump {
-            let cap = usize::try_from(p.fit.clamp(1, 100_000)).unwrap_or(1);
+        let cap = usize::try_from(p.fit.clamp(1, 100_000)).unwrap_or(1);
+        // Feed the running stream and publish its frames.
+        if let (Some(r), Some(pv)) = (&mut self.current, &mut self.preview) {
+            // An edit: the server renders again from the first frame it changes.
+            if p.revision != r.revision {
+                r.revision = p.revision;
+                r.client.stream_sync(p.revision, p.project);
+            }
             let mut b = r.shared.buffer();
             b.range = range;
             b.cap = cap;
-            drop(b);
-            r.range = range;
-            r.client.stream_seek(p.rate.tick_of(p.cur));
-        }
-        r.cur = p.cur;
-        // Stalls after the warm-up.
-        let dt = (p.now - r.seen).max(0.0);
-        r.seen = p.now;
-        let mut b = r.shared.buffer();
-        b.set_playhead(p.cur);
-        if b.stats.warmup_ms.is_some() {
-            if p.waiting {
-                if !r.stalled {
-                    b.stats.stalls = b.stats.stalls.saturating_add(1);
+            b.set_playhead(p.cur);
+            if b.stats.warmup_ms.is_some() {
+                let dt = (p.now - pv.seen).max(0.0);
+                if p.waiting {
+                    if !pv.stalled {
+                        b.stats.stalls = b.stats.stalls.saturating_add(1);
+                    }
+                    b.stats.stall_ms += dt * 1000.0;
                 }
-                b.stats.stall_ms += dt * 1000.0;
+                pv.stalled = p.waiting;
             }
-            r.stalled = p.waiting;
+            let ready = b.publish(&p.series);
+            drop(b);
+            pv.to_disk = pv.to_disk.saturating_add(Self::keep(frames, p, ready));
+            if p.now - pv.playhead_at >= PLAYHEAD_EVERY || jump {
+                pv.playhead_at = p.now;
+                r.client.stream_playhead(p.rate.tick_of(p.cur), true);
+            }
         }
-        let ready = b.publish(&p.series);
-        drop(b);
-        for (k, img) in ready {
-            frames.insert_streamed(k, img);
+        if let Some(pv) = &mut self.preview {
+            pv.seen = p.now;
         }
-        if p.now - r.playhead_at >= PLAYHEAD_EVERY || jump {
-            r.playhead_at = p.now;
-            r.client.stream_playhead(p.rate.tick_of(p.cur), true);
-        }
-        PlayTick { streamed: true, note: None }
+        self.plan(client, p, frames, ctx, range, cap)
     }
 
-    /// Stop the stream (if any) and take its low-resolution and stale frames out of the cache;
-    /// `shown`: the frame on screen, taken out too so the paused viewer gets its exact frame.
-    pub fn halt(&mut self, frames: &Frames, shown: Option<FrameKey>) {
+    /// Start a stream for the first run of frames ahead that this Mac doesn't hold (RAM, a
+    /// stream's fresh frame, or the disk cache), unless the running one covers it.
+    fn plan(
+        &mut self,
+        client: &Arc<CloudFrames>,
+        p: &PlayNow<'_>,
+        frames: &Frames,
+        ctx: Option<&egui::Context>,
+        range: (i64, i64, bool),
+        cap: usize,
+    ) -> PlayTick {
+        let streamed = PlayTick { streamed: true, note: None };
+        let Some(pv) = &mut self.preview else { return streamed };
+        let order = play_order(p.cur, range, p.fit);
+        if pv.loader.as_ref().is_none_or(|l| l.series != p.series) {
+            pv.loader = None;
+            if let Some(dc) = &p.disk {
+                if !frames.content_key_ready(p.project, &p.series) {
+                    if p.now - pv.started < KEY_WAIT && self.current.is_none() {
+                        return streamed;
+                    }
+                } else {
+                    let ram = frames.cached_frames(&p.series);
+                    let oh = opts_hash(&p.opts);
+                    let jobs: Vec<(i64, u128, bool)> = order
+                        .iter()
+                        .filter(|f| ram.binary_search(f).is_err())
+                        .filter_map(|f| frames.streamed_on_disk(dc, p.project, &FrameKey { frame: *f, ..p.series }, oh).map(|(k, d)| (*f, k, d)))
+                        .collect();
+                    pv.loader = Some(Loader::start(dc.clone(), frames.streamed_sink(), p.series, jobs));
+                }
+            }
+        }
+        let ram = frames.cached_frames(&p.series);
+        let buffer = self.current.as_ref().map(|r| r.shared.clone());
+        let loader = pv.loader.as_ref().filter(|l| l.series == p.series);
+        let held = |f: i64| {
+            let stale = buffer.as_ref().is_some_and(|b| b.buffer().stale(f));
+            (ram.binary_search(&f).is_ok() && !stale) || loader.is_some_and(|l| l.pending(f))
+        };
+        let next = missing_run(&order, held);
+        if self.current.is_none() && pv.streams == 0 {
+            pv.held = order.iter().filter(|f| held(**f)).count() as u64;
+        }
+        let Some((a, b)) = next else {
+            // Everything ahead is here: no stream (a running one finishes its run).
+            return streamed;
+        };
+        if let Some(r) = &self.current {
+            let covered = a >= r.run.0 && a <= r.run.1;
+            let done = (r.run.0..=r.run.1).all(&held);
+            if covered || !done {
+                return streamed;
+            }
+        }
+        // A new stream for the run `a..=b`.
+        self.halt(frames, None, p.revision);
+        let Some(pv) = &mut self.preview else { return streamed };
+        pv.streams = pv.streams.saturating_add(1);
+        let ahead = AHEAD_SECS.min(((p.fit as f64 * 0.6) / p.rate.as_f64().max(1.0)) as f32).max(1.0);
+        let shared = StreamShared::new(StreamBuffer::new(p.cur, range, cap), p.rate, ctx.cloned());
+        let start = StreamStart {
+            project: p.project.clone(),
+            revision: p.revision,
+            comp: p.comp,
+            from: p.rate.tick_of(a),
+            to: Some(p.rate.tick_of(b.saturating_add(1))),
+            loop_from: None,
+            looping: false,
+            opts: p.opts,
+            ahead_secs: ahead,
+            cache: frames.cache_series(p.project, &p.series, &p.opts),
+        };
+        client.stream_start(start, shared.clone());
+        client.stream_playhead(p.rate.tick_of(p.cur), true);
+        pv.playhead_at = p.now;
+        self.current = Some(Running { shared, client: client.clone(), revision: p.revision, run: (a, b) });
+        streamed
+    }
+
+    /// Cache a stream's frames (drafts below full size) and write the current ones to the disk
+    /// cache, when it has room. How many went to disk.
+    fn keep(frames: &Frames, p: &PlayNow<'_>, ready: Vec<Published>) -> u64 {
+        let oh = opts_hash(&p.opts);
+        let mut stored = 0u64;
+        for f in ready {
+            if f.current
+                && let Some(dc) = &p.disk
+                && dc.has_room(f.img.as_raw().len())
+                && let Some(k) = frames.streamed_disk_key(p.project, &f.key, oh, f.scale)
+            {
+                dc.put_frame(k, f.img.size[0] as u32, f.img.size[1] as u32, ImageBytes(f.img.clone()));
+                stored = stored.saturating_add(1);
+            }
+            frames.insert_streamed(f.key, f.img, f.draft);
+        }
+        stored
+    }
+
+    /// The preview is over: its numbers stay with the last stream's (`ui.inspect`).
+    fn end_preview(&mut self) {
+        if self.preview.is_some() {
+            self.last = self.stats();
+        }
+        self.preview = None;
+    }
+
+    /// The preview stopped: stop its stream (see [`CloudPlayback::halt`]) and forget it.
+    pub fn stop(&mut self, frames: &Frames, shown: Option<FrameKey>, revision: u64) {
+        self.halt(frames, shown, revision);
+        self.end_preview();
+    }
+
+    /// Stop the stream (if any) and take its stale frames out of the cache (below-full-size
+    /// ones stay, as drafts); `shown`: the frame on screen, taken out too when it came full size
+    /// from the stream, so the paused viewer gets its exact frame (a draft there is rendered over).
+    pub fn halt(&mut self, frames: &Frames, shown: Option<FrameKey>, revision: u64) {
         let Some(r) = self.current.take() else { return };
         r.client.stream_stop();
         let mut b = r.shared.buffer();
         if b.failed.is_none() {
             b.stats.state = "stopped".into();
         }
-        let dirty = b.take_dirty();
-        let streamed_shown = shown.filter(|k| b.frames.get(&k.frame).is_some_and(|h| h.published == Some(*k)));
+        let dirty = b.take_dirty(revision);
+        let streamed_shown = shown.filter(|k| b.frames.get(&k.frame).is_some_and(|h| h.published == Some(*k)) && !frames.is_draft(k));
         self.last = Some(b.stats.clone());
         drop(b);
         for k in dirty.iter().chain(streamed_shown.iter()) {
             frames.remove_frame(k);
         }
+    }
+}
+
+/// A frame's pixels for the disk cache's writer (shared, not copied).
+struct ImageBytes(Arc<egui::ColorImage>);
+
+impl AsRef<[u8]> for ImageBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_raw()
     }
 }
 

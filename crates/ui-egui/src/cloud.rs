@@ -1261,6 +1261,9 @@ mod tests {
         /// Precache plans received (CR8; answered: every frame cached) and render requests' keys.
         precaches: Arc<Mutex<Vec<Precache>>>,
         render_keys: Arc<Mutex<Vec<Option<String>>>>,
+        /// CR6c: the streams started (from, to), and whether they send half-size chunks only.
+        starts: Arc<Mutex<Vec<(Tick, Option<Tick>)>>>,
+        half_only: Arc<AtomicBool>,
     }
 
     fn stream_down(r: StreamReply) -> Down {
@@ -1306,6 +1309,8 @@ mod tests {
             let mi = missing.clone();
             let (precaches, render_keys): (Arc<Mutex<Vec<Precache>>>, Arc<Mutex<Vec<Option<String>>>>) = Default::default();
             let (pcs, rks) = (precaches.clone(), render_keys.clone());
+            let (starts, half_only): (Arc<Mutex<Vec<(Tick, Option<Tick>)>>>, Arc<AtomicBool>) = (Arc::default(), Arc::default());
+            let (sa, ho) = (starts.clone(), half_only.clone());
             std::thread::spawn(move || {
                 while !k.load(Ordering::Acquire) {
                     let Ok((stream, _)) = listener.accept() else {
@@ -1314,7 +1319,7 @@ mod tests {
                     };
                     stream.set_nonblocking(false).unwrap();
                     ss.lock().unwrap().push(stream.try_clone().unwrap());
-                    let (st, r, mi, pcs, rks) = (st.clone(), r.clone(), mi.clone(), pcs.clone(), rks.clone());
+                    let (st, r, mi, pcs, rks, sa, ho) = (st.clone(), r.clone(), mi.clone(), pcs.clone(), rks.clone(), sa.clone(), ho.clone());
                     let ls: Arc<Mutex<Option<u64>>> = Arc::default();
                     std::thread::spawn(move || {
                         let (mut rd, mut wr) = (stream.try_clone().unwrap(), stream);
@@ -1335,14 +1340,18 @@ mod tests {
                                 }
                                 // CR6b: a playback stream of 32×18 chunks — chunk 1 before chunk 0
                                 // (out of order), chunk 0 at half size, then its full-size upgrade.
-                                Up::Msg { msg: FrameMsg::Stream(StreamMsg::Start { stream, .. }), .. } => {
+                                Up::Msg { msg: FrameMsg::Stream(StreamMsg::Start { stream, from, to, .. }), .. } => {
+                                    sa.lock().unwrap().push((from, to));
                                     let rate = effectcraft_engine::time::FrameRate::new(30, 1);
                                     let started =
                                         StreamReply::Started { stream, width: 32, height: 18, frame_rate: rate, chunk_frames: 15, codec: StreamCodec::H264 };
                                     let mut out = vec![(stream_down(started), vec![])];
-                                    for (seq, index, w, h, color) in
-                                        [(1u64, 1i64, 32, 18, [255, 0, 0]), (2, 0, 16, 8, [255, 0, 0]), (3, 0, 32, 18, [255, 0, 0])]
-                                    {
+                                    let chunks: &[(u64, i64, u32, u32, [u8; 3])] = if ho.load(Ordering::Acquire) {
+                                        &[(1, 0, 16, 8, [255, 0, 0]), (2, 1, 16, 8, [255, 0, 0])]
+                                    } else {
+                                        &[(1, 1, 32, 18, [255, 0, 0]), (2, 0, 16, 8, [255, 0, 0]), (3, 0, 32, 18, [255, 0, 0])]
+                                    };
+                                    for &(seq, index, w, h, color) in chunks {
                                         out.push(fake_chunk(stream, seq, 1, index, w, h, color));
                                     }
                                     *ls.lock().unwrap() = Some(stream);
@@ -1407,7 +1416,7 @@ mod tests {
                     });
                 }
             });
-            FakeServer { addr, kill, stall, renders, streams, missing, precaches, render_keys }
+            FakeServer { addr, kill, stall, renders, streams, missing, precaches, render_keys, starts, half_only }
         }
 
         /// Pull the tunnel: every connection drops and nothing answers on the port again.
@@ -1546,6 +1555,7 @@ mod tests {
                 looping: false,
                 waiting: true,
                 fit: 1000,
+                disk: None,
             };
             play.tick(Some(&cloud), &p, frames, None)
         };
@@ -1592,6 +1602,127 @@ mod tests {
         assert!(frames.is_cached(&FrameKey { frame: 3, ..k1 }), "current full frames stay");
         let st = play.stats().unwrap();
         assert!(st.state == "failed" || st.state == "stopped", "{st:?}");
+    }
+
+    /// CR6c: a preview's half-size stream frames stay on this Mac when it stops (drafts, in RAM
+    /// and in the disk cache); playing it again starts no stream, and neither does playing it
+    /// after a restart (the frames are read back from the disk cache, still drafts). The paused
+    /// viewer renders the exact frame over a draft.
+    #[test]
+    fn played_frames_stay_on_this_mac_and_replay_without_streaming_even_after_a_restart() {
+        use crate::cloud_stream::{CloudPlayback, PlayNow};
+        use crate::frames::{FrameKey, Frames, RenderSource, opts_hash};
+        use effectcraft_engine::render::RenderOpts;
+        use effectcraft_engine::render::disk_cache::DiskCache;
+        let server = FakeServer::start("secret");
+        server.half_only.store(true, Ordering::Release);
+        let cloud = CloudFrames::connect(&server.addr, "secret", None);
+        let mut s = effectcraft_engine::Session::default();
+        s.execute("comp.new", serde_json::json!({"width": 32, "height": 18, "duration": 1, "frameRate": 30})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        cloud.offer(s.revision, &s.project);
+        wait_until("the cloud to hold the project", || cloud.ready());
+        let dir = std::env::temp_dir().join(format!("effectcraft-cr6c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let rate = s.project.comp(cid).unwrap().frame_rate;
+        let opts = RenderOpts::default();
+        let series = |frames: &Frames| FrameKey {
+            revision: s.revision,
+            content: frames.content_of(&s.project, s.revision, cid),
+            comp: cid.0,
+            frame: 0,
+            scale: 1000,
+            view: 0,
+            opts: opts_hash(&opts),
+        };
+        let tick = |play: &mut CloudPlayback, frames: &Frames, playing: bool, cur: i64, now: f64| {
+            let p = PlayNow {
+                playing,
+                now,
+                comp: cid,
+                rate,
+                project: &s.project,
+                revision: s.revision,
+                series: series(frames),
+                opts,
+                cur,
+                start: 0,
+                end: 29,
+                looping: false,
+                waiting: true,
+                fit: 1000,
+                disk: Some(dc.clone()),
+            };
+            play.tick(Some(&cloud), &p, frames, None)
+        };
+        let all_cached = |frames: &Frames| (0..30).all(|f| frames.is_cached(&FrameKey { frame: f, ..series(frames) }));
+        let warm = |frames: &Frames| wait_until("the content key", || frames.content_key_ready(&s.project, &series(frames)));
+
+        // First play: one stream for frames 0–29; they come at half size.
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        warm(&frames);
+        let mut play = CloudPlayback::default();
+        let mut now = 0.0;
+        wait_until("the streamed frames", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, true, 0, now).streamed);
+            all_cached(&frames)
+        });
+        assert_eq!(server.starts.lock().unwrap().clone(), vec![(Tick(0), Some(rate.tick_of(30)))], "one stream, for the missing run");
+        // Pause: the drafts stay (lighter on the cache bar).
+        tick(&mut play, &frames, false, 0, now + 0.02);
+        assert!(!play.active());
+        assert!(all_cached(&frames), "pausing keeps the drafts");
+        let k5 = FrameKey { frame: 5, ..series(&frames) };
+        assert!(frames.is_draft(&k5) && !frames.is_exact(&k5));
+        assert_eq!(frames.draft_frames(&series(&frames)), (0..30).collect::<Vec<_>>(), "all drafts (the one on screen shows until its exact frame lands)");
+
+        // Play again: no stream, the frames play from this Mac.
+        for i in 0..20 {
+            assert!(tick(&mut play, &frames, true, i, now + 0.1 + f64::from(i as u8) * 0.033).streamed);
+        }
+        assert_eq!(server.starts.lock().unwrap().len(), 1, "a replay asks the cloud for nothing it holds");
+        assert!(play.stats().is_some_and(|st| st.held >= 10), "{:?}", play.stats());
+        tick(&mut play, &frames, false, 19, now + 1.0);
+
+        // The paused viewer renders the frame on screen exactly: over a draft, not as a hit.
+        let src = RenderSource {
+            freeze_feedback: Default::default(),
+            project: s.project.clone(),
+            footage: s.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let renders = server.renders.load(Ordering::Acquire);
+        frames.request_urgent(&src, k5, cid, rate.tick_of(5), opts);
+        assert_eq!(frames.inflight(), 0, "playback's request takes the draft");
+        frames.request_exact(&src, k5, cid, rate.tick_of(5), opts);
+        wait_until("the exact frame", || frames.is_exact(&k5));
+        assert_eq!(server.renders.load(Ordering::Acquire), renders + 1);
+        assert_eq!(frames.get(&k5).map(|i| i.size()), Some([32, 18]), "the full frame replaced the draft");
+
+        // Restart: an empty RAM preview, the disk cache holds the drafts.
+        dc.flush();
+        drop(play);
+        let mut frames = Frames::default();
+        frames.set_remote(Some(cloud.clone()));
+        warm(&frames);
+        let mut play = CloudPlayback::default();
+        let mut now = 10.0;
+        wait_until("the frames read back from disk", || {
+            now += 0.02;
+            assert!(tick(&mut play, &frames, true, 0, now).streamed);
+            all_cached(&frames)
+        });
+        assert_eq!(server.starts.lock().unwrap().len(), 1, "after a restart too, nothing is streamed again");
+        assert!(frames.is_draft(&FrameKey { frame: 7, ..series(&frames) }), "a draft on disk comes back a draft");
+        assert!(play.stats().is_some_and(|st| st.from_disk >= 29), "{:?}", play.stats());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CR7: while the cloud machine lacks a file or font, frames render here and the status
