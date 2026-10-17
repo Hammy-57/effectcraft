@@ -1718,6 +1718,13 @@ fn card_menu_entries(
 #[derive(Clone, Debug)]
 struct FolderDrag(String);
 
+/// What is dropped on `resp`, when it's a `P`. egui's `dnd_release_payload` takes the payload
+/// whatever its type (a card dropped on a folder row was lost to the row's folder-drop check),
+/// so the type is checked first and anything else is left for the next check.
+fn dropped<P: std::any::Any + Send + Sync>(resp: &egui::Response) -> Option<Arc<P>> {
+    if egui::DragAndDrop::has_payload_of_type::<P>(&resp.ctx) { resp.dnd_release_payload::<P>() } else { None }
+}
+
 /// Where a folder dropped on a row goes: before or after it (a sibling), or inside it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DropPlace {
@@ -2244,7 +2251,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 }
             }
-            if let Some(fd) = resp.dnd_release_payload::<FolderDrag>()
+            if let Some(fd) = dropped::<FolderDrag>(&resp)
                 && fd.0 != path
                 && !under(path, &fd.0)
             {
@@ -2258,7 +2265,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 sp.rect_stroke(r, CornerRadius::same((5.0 * s) as u8), Stroke::new(1.5, t.accent), egui::StrokeKind::Inside);
             }
             if !path.is_empty()
-                && let Some(payload) = resp.dnd_release_payload::<super::DragPayload>()
+                && let Some(payload) = dropped::<super::DragPayload>(&resp)
                 && let super::DragPayload::LibraryCard(id) = payload.as_ref()
                 && lib.cards.contains_key(id)
             {
