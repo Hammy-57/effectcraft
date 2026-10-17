@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::hash::sha256_hex;
-use crate::manifest::{BlobRef, Card, CardFile, Collection, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
+use crate::manifest::{BlobRef, Card, CardFile, Collection, Crop, HEAD_KEY, Head, Manifest, Placeholder, decode_blob, encode_blob};
 use crate::remote::{Remote, get_blocking};
 
 /// Ticks per second (`effectcraft_time::Tick`), to report placeholder durations in seconds.
@@ -362,6 +362,7 @@ impl Builder<'_> {
             kind: "mac".into(),
             kind_label: text(e, "type_label"),
             location: text(e, "location"),
+            crop: e.get("crop").and_then(|c| serde_json::from_value::<Crop>(c.clone()).ok()).and_then(Crop::valid),
             description: e.get("raw_description").and_then(Value::as_str).map_or_else(|| text(e, "description"), str::to_string),
             tags: strings(e, "tags"),
             aliases: strings(e, "aliases"),
@@ -403,6 +404,7 @@ impl Builder<'_> {
             kind: kind.clone(),
             kind_label: text(e, "type_label"),
             location: text(e, "location"),
+            crop: e.get("crop").and_then(|c| serde_json::from_value::<Crop>(c.clone()).ok()).and_then(Crop::valid),
             comp: text(e, "comp"),
             // The library's own description when the index carries it (search parity with
             // retrieval.py); else the index's display text.

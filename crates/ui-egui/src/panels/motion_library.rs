@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use effectcraft_engine::motion_library::LocalIndex;
-use effectcraft_engine::motionlib::{BlobRef, BlobState, Card, Client, FolderRow};
+use effectcraft_engine::motionlib::{BlobRef, BlobState, Card, Client, Crop, FolderRow};
 use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, pos2, vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -184,12 +184,25 @@ impl Drop for ThumbSlot {
     }
 }
 
-/// Decode an image's bytes and shrink it to fit `side` × `side` (unpremultiplied RGBA).
-fn decode_image(bytes: &[u8], side: u32) -> ThumbPixels {
+/// Decode an image's bytes, cut to `crop` (its visible artwork) and shrink it to fit `side` ×
+/// `side` (unpremultiplied RGBA).
+fn decode_image(bytes: &[u8], side: u32, crop: Option<Crop>) -> ThumbPixels {
     let img = image::load_from_memory(bytes).ok()?;
+    let img = match crop.and_then(|c| c.on(img.width(), img.height())) {
+        Some([x, y, w, h]) => img.crop_imm(x, y, w, h),
+        None => img,
+    };
     let img = if img.width().max(img.height()) > side { img.thumbnail(side, side) } else { img };
     let rgba = img.to_rgba8();
     Some(([rgba.width(), rgba.height()], rgba.into_raw()))
+}
+
+/// A thumbnail's cache key: its file and the crop it shows.
+fn thumb_key(file: &str, crop: Option<Crop>) -> String {
+    match crop {
+        Some(c) => format!("{file}#{},{},{},{}", c.x, c.y, c.width, c.height),
+        None => file.to_string(),
+    }
 }
 
 /// A thumbnail decoded before, or whose decode just finished: `Some(thumb)` once known (`None`
@@ -221,7 +234,7 @@ fn failed_thumb(ctx: &egui::Context, key: &str, side: u32) {
 }
 
 /// Decode a thumbnail off the UI thread (`load` gives its bytes), a few at a time.
-fn start_thumb(ctx: &egui::Context, key: &str, side: u32, budget: &mut u32, load: impl FnOnce() -> Option<Vec<u8>> + Send + 'static) {
+fn start_thumb(ctx: &egui::Context, key: &str, side: u32, crop: Option<Crop>, budget: &mut u32, load: impl FnOnce() -> Option<Vec<u8>> + Send + 'static) {
     let jid = egui::Id::new(("ml-thumb-job", key, side));
     if ctx.data(|d| d.get_temp::<ThumbJob>(jid)).is_some() || *budget == 0 || THUMB_JOBS.load(Ordering::Relaxed) >= MAX_THUMB_JOBS {
         return;
@@ -231,7 +244,7 @@ fn start_thumb(ctx: &egui::Context, key: &str, side: u32, budget: &mut u32, load
     ctx.data_mut(|d| d.insert_temp(jid, job.clone()));
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = job.set(load().and_then(|b| decode_image(&b, side)));
+        let _ = job.set(load().and_then(|b| decode_image(&b, side, crop)));
         ctx.request_repaint();
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -241,7 +254,7 @@ fn start_thumb(ctx: &egui::Context, key: &str, side: u32, budget: &mut u32, load
         let ctx2 = ctx.clone();
         let spawned = std::thread::Builder::new().name("ec-library-thumb".into()).spawn(move || {
             let _slot = slot;
-            let _ = job.set(load().and_then(|b| decode_image(&b, side)));
+            let _ = job.set(load().and_then(|b| decode_image(&b, side, crop)));
             ctx2.request_repaint();
         });
         if spawned.is_err() {
@@ -251,32 +264,34 @@ fn start_thumb(ctx: &egui::Context, key: &str, side: u32, budget: &mut u32, load
 }
 
 /// A card's thumbnail texture: downloaded (as it scrolls into view) and decoded off the UI thread.
-fn thumbnail(ctx: &egui::Context, client: &Client, blob: &BlobRef, side: u32, budget: &mut u32) -> Thumb {
-    if let Some(t) = cached_thumb(ctx, &blob.hash, side) {
+fn thumbnail(ctx: &egui::Context, client: &Client, blob: &BlobRef, side: u32, crop: Option<Crop>, budget: &mut u32) -> Thumb {
+    let key = thumb_key(&blob.hash, crop);
+    if let Some(t) = cached_thumb(ctx, &key, side) {
         return t;
     }
     match client.blob(blob) {
         BlobState::Ready(_) => {}
         BlobState::Loading => return None,
         BlobState::Failed(_) => {
-            failed_thumb(ctx, &blob.hash, side);
+            failed_thumb(ctx, &key, side);
             return None;
         }
     }
     if *budget > 0 && THUMB_JOBS.load(Ordering::Relaxed) < MAX_THUMB_JOBS {
         let bytes = client.blob_bytes(blob)?;
-        start_thumb(ctx, &blob.hash, side, budget, move || Some(bytes));
+        start_thumb(ctx, &key, side, crop, budget, move || Some(bytes));
     }
     None
 }
 
 /// A thumbnail from this Mac's library folder (cards the catalog doesn't list yet).
-fn local_thumbnail(ctx: &egui::Context, path: &str, side: u32, budget: &mut u32) -> Thumb {
-    if let Some(t) = cached_thumb(ctx, path, side) {
+fn local_thumbnail(ctx: &egui::Context, path: &str, side: u32, crop: Option<Crop>, budget: &mut u32) -> Thumb {
+    let key = thumb_key(path, crop);
+    if let Some(t) = cached_thumb(ctx, &key, side) {
         return t;
     }
     let owned = path.to_string();
-    start_thumb(ctx, path, side, budget, move || std::fs::read(owned).ok());
+    start_thumb(ctx, &key, side, crop, budget, move || std::fs::read(owned).ok());
     None
 }
 
@@ -380,12 +395,12 @@ fn natural_key(name: &str) -> Vec<(u64, String)> {
 }
 
 /// Decode PNG frames for the hover preview, appending them as they come.
-fn decode_frames(paths: &[String], frames: &Mutex<Vec<([u32; 2], Vec<u8>)>>, cancel: &AtomicBool, ctx: &egui::Context) {
+fn decode_frames(paths: &[String], crop: Option<Crop>, frames: &Mutex<Vec<([u32; 2], Vec<u8>)>>, cancel: &AtomicBool, ctx: &egui::Context) {
     for path in paths {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Some((size, px)) = std::fs::read(path).ok().and_then(|b| decode_image(&b, PREVIEW_SIDE)) else { continue };
+        let Some((size, px)) = std::fs::read(path).ok().and_then(|b| decode_image(&b, PREVIEW_SIDE, crop)) else { continue };
         if let Ok(mut v) = frames.lock() {
             v.push((size, px));
         }
@@ -410,9 +425,9 @@ fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, loc
         let state = match local_preview(local, card) {
             Some(LocalPreview::Movie(path)) => BlobState::Ready(Some(std::path::PathBuf::from(path))),
             Some(LocalPreview::Frames(paths)) => {
-                let (frames, done, cancel, ctx2) = (p.frames.clone(), p.done.clone(), p.cancel.clone(), ctx.clone());
+                let (frames, done, cancel, ctx2, crop) = (p.frames.clone(), p.done.clone(), p.cancel.clone(), ctx.clone(), card.crop);
                 let work = move || {
-                    decode_frames(&paths, &frames, &cancel, &ctx2);
+                    decode_frames(&paths, crop, &frames, &cancel, &ctx2);
                     done.store(true, Ordering::Relaxed);
                     ctx2.request_repaint();
                 };
@@ -447,10 +462,10 @@ fn preview_frame(app: &EffectcraftApp, ctx: &egui::Context, client: &Client, loc
                     return None;
                 };
                 let footage = app.session.footage.clone();
-                let (frames, done, cancel, ctx2) = (p.frames.clone(), p.done.clone(), p.cancel.clone(), ctx.clone());
+                let (frames, done, cancel, ctx2, crop) = (p.frames.clone(), p.done.clone(), p.cancel.clone(), ctx.clone(), card.crop);
                 let path = path.to_string_lossy().to_string();
                 let work = move || {
-                    decode_preview(&*imp, &*footage, &path, &frames, &cancel, &ctx2);
+                    decode_preview(&*imp, &*footage, &path, crop, &frames, &cancel, &ctx2);
                     done.store(true, Ordering::Relaxed);
                     ctx2.request_repaint();
                 };
@@ -493,6 +508,7 @@ fn decode_preview(
     imp: &dyn effectcraft_engine::Importer,
     footage: &dyn effectcraft_engine::render::FootageSource,
     path: &str,
+    crop: Option<Crop>,
     frames: &Mutex<Vec<([u32; 2], Vec<u8>)>>,
     cancel: &AtomicBool,
     ctx: &egui::Context,
@@ -510,6 +526,17 @@ fn decode_preview(
         }
         let t = effectcraft_engine::time::Tick::from_seconds_f64(k as f64 / PREVIEW_FPS);
         let Some(img) = footage.frame(item, &f, t) else { break };
+        // The card's visible artwork only (a transparent element in a big frame).
+        if let Some([x, y, w, h]) = crop.and_then(|c| c.on(img.width, img.height))
+            && let Some(full) = image::RgbaImage::from_raw(img.width, img.height, img.to_rgba8())
+        {
+            let cut = image::DynamicImage::ImageRgba8(full).crop_imm(x, y, w, h).thumbnail(PREVIEW_SIDE, PREVIEW_SIDE).to_rgba8();
+            if let Ok(mut v) = frames.lock() {
+                v.push(([cut.width(), cut.height()], cut.into_raw()));
+            }
+            ctx.request_repaint();
+            continue;
+        }
         let (w, h) = (img.width.max(1), img.height.max(1));
         let s = (PREVIEW_SIDE as f64 / w.max(h) as f64).min(1.0);
         let small = if s < 1.0 {
@@ -534,6 +561,17 @@ fn is_local(card: &Card, local: &LocalIndex) -> bool {
 /// The card can be applied here (from the bucket or this machine's library folder).
 fn usable(card: &Card, local: &LocalIndex) -> bool {
     card.applicable() || is_local(card, local)
+}
+
+/// How a card EffectCraft can't apply here is labelled: on a machine without the library's files
+/// it's "on the Mac"; on the Mac that has them, it's a kind only After Effects uses (Layers,
+/// presets, expressions…).
+fn mac_words(local: &LocalIndex) -> (&'static str, &'static str) {
+    if local.is_empty() {
+        ("on the Mac", "On the Mac: apply it in After Effects there")
+    } else {
+        ("AE only", "After Effects only: EffectCraft can't use this kind yet; apply it from the Motion Library panel in After Effects")
+    }
 }
 
 /// Listed only: applied in After Effects on the Mac that has its files.
@@ -621,6 +659,12 @@ fn visible_cards(ctx: &egui::Context, client: &Client, local: &Arc<LocalIndex>, 
         .filter(|c| !view.here_only || usable(c, local))
         .cloned()
         .collect();
+    // This Mac's crops (the library folder's index) over the catalog's.
+    for c in &mut cards {
+        if let Some(crop) = local.get(&c.id).and_then(|e| e.crop) {
+            c.crop = Some(crop);
+        }
+    }
     if grouped(view)
         && let Some(cat) = &cat
     {
@@ -707,7 +751,10 @@ struct Layout {
 
 /// The height of a card's thumbnail at `col_w` (its own shape; 16:10 without a thumbnail).
 fn thumb_height(card: &Card, col_w: f32) -> f32 {
-    let aspect = card.thumb_size.filter(|[w, h]| *w > 0 && *h > 0).map_or(10.0 / 16.0, |[w, h]| h as f32 / w as f32);
+    let aspect = match card.crop.and_then(Crop::valid) {
+        Some(c) => c.height as f32 / c.width as f32,
+        None => card.thumb_size.filter(|[w, h]| *w > 0 && *h > 0).map_or(10.0 / 16.0, |[w, h]| h as f32 / w as f32),
+    };
     (col_w * aspect.clamp(0.2, 2.5)).round()
 }
 
@@ -785,7 +832,7 @@ fn paint_folder_icon(ctx: &egui::Context, client: &Client, p: &egui::Painter, ro
         return;
     };
     if let Some(blob) = &row.icon
-        && let Some((tex, [w, h])) = thumbnail(ctx, client, blob, 64, budget)
+        && let Some((tex, [w, h])) = thumbnail(ctx, client, blob, 64, None, budget)
     {
         let s = (r.width() / w.max(1) as f32).min(r.height() / h.max(1) as f32);
         let ir = Rect::from_center_size(r.center(), vec2(w as f32, h as f32) * s);
@@ -1323,7 +1370,9 @@ fn details_sheet(
     let img = Rect::from_min_size(pos2(inner.center().x - iw / 2.0, inner.min.y), vec2(iw, ih));
     p.rect_filled(img, CornerRadius::same(6), t.field_bg);
     let mut budget = 2u32;
-    if let Some((tex, [tw, th])) = card.thumbnail.as_ref().and_then(|b| thumbnail(ctx, client, b, thumb_side(iw, ctx.pixels_per_point()), &mut budget)) {
+    if let Some((tex, [tw, th])) =
+        card.thumbnail.as_ref().and_then(|b| thumbnail(ctx, client, b, thumb_side(iw, ctx.pixels_per_point()), card.crop, &mut budget))
+    {
         paint_cover(&p, tex.id(), vec2(tw as f32, th as f32), img);
     }
     let mut y = img.max.y + 14.0 * s;
@@ -1344,7 +1393,7 @@ fn details_sheet(
             facts.push(tr("not synced: right-click ▸ Save to Library uploads it").to_string());
         }
     } else if card.on_mac {
-        facts.push(tr("on the Mac: apply it in After Effects there").to_string());
+        facts.push(mac_words(&local).1.to_string());
     } else {
         let bytes: u64 = card.apply_blobs().iter().map(|b| b.size).sum();
         facts.push(format!(
@@ -1382,7 +1431,7 @@ fn details_sheet(
             view.details = None;
         }
     } else {
-        p.text(apply_r.center(), Align2::CENTER_CENTER, tr("On the Mac"), Tokens::medium(11.5 * s), t.text_faint);
+        p.text(apply_r.center(), Align2::CENTER_CENTER, tr(if local.is_empty() { "On the Mac" } else { "AE only" }), Tokens::medium(11.5 * s), t.text_faint);
     }
     apply
 }
@@ -1685,12 +1734,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let tex = live.map(|t| (t.id(), t.size_vec2())).or_else(|| {
                     // This Mac's library folder first (as the web panel), the bucket's copy else.
                     let thumb = match local.get(&card.id).filter(|e| !e.thumbnail.is_empty()) {
-                        Some(e) => match cached_thumb(&ctx, &e.thumbnail, side) {
+                        Some(e) => match cached_thumb(&ctx, &thumb_key(&e.thumbnail, card.crop), side) {
                             Some(Some(t)) => Some(t),
-                            Some(None) => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, &mut budget)),
-                            None => local_thumbnail(&ctx, &e.thumbnail, side, &mut budget),
+                            Some(None) => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, card.crop, &mut budget)),
+                            None => local_thumbnail(&ctx, &e.thumbnail, side, card.crop, &mut budget),
                         },
-                        None => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, &mut budget)),
+                        None => card.thumbnail.as_ref().and_then(|b| thumbnail(&ctx, &client, b, side, card.crop, &mut budget)),
                     };
                     thumb.map(|(tex, [w, h])| (tex.id(), vec2(w as f32, h as f32)))
                 });
@@ -1709,7 +1758,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // A badge: footage to relink, or a card applied in After Effects on the Mac.
                 let badge = if on_mac(card, &local) {
-                    Some((tr("on the Mac"), Color32::from_black_alpha(170), t.text))
+                    Some((tr(mac_words(&local).0), Color32::from_black_alpha(170), t.text))
                 } else if needs_footage(card, &local) {
                     Some((tr("needs footage"), t.warning.gamma_multiply(0.9), Color32::BLACK))
                 } else {
@@ -1791,7 +1840,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     gp.text(pos2(cx, thumb_r.max.y + 28.0 * s), Align2::LEFT_CENTER, &meta, meta_font, t.text_faint);
                 }
                 let label = if on_mac(card, &local) {
-                    format!("{} (on the Mac)", card.name)
+                    format!("{} ({})", card.name, mac_words(&local).0)
                 } else if needs_footage(card, &local) {
                     format!("{} (needs footage)", card.name)
                 } else {
@@ -1808,7 +1857,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     if usable(card, &local) {
                         apply_now = Some(card.id.clone());
                     } else {
-                        app.ui.status = format!("“{}” is on the Mac: apply it in After Effects there", card.name);
+                        app.ui.status = format!("“{}”: {}", card.name, mac_words(&local).1);
                     }
                 }
                 if hovered {
@@ -1817,11 +1866,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         let names: Vec<&str> = card.placeholders.iter().map(|p| p.name.as_str()).take(3).collect();
                         tip.push_str(&format!("\nNeeds footage: {}", names.join(", ")));
                     }
-                    tip.push_str(if on_mac(card, &local) {
-                        "\nOn the Mac: apply it in After Effects there"
-                    } else {
-                        "\nDouble-click to add, or drag it onto the Timeline"
-                    });
+                    tip.push('\n');
+                    tip.push_str(if on_mac(card, &local) { mac_words(&local).1 } else { "Double-click to add, or drag it onto the Timeline" });
                     resp.on_hover_text(tip);
                 }
             }
@@ -1869,7 +1915,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 apply_now = Some(card.id.clone());
             }
         } else {
-            p.text(pos2(ar.max.x, ar.center().y), Align2::RIGHT_CENTER, tr("On the Mac"), Tokens::medium(11.5 * s), t.text_faint);
+            p.text(
+                pos2(ar.max.x, ar.center().y),
+                Align2::RIGHT_CENTER,
+                tr(if local.is_empty() { "On the Mac" } else { "AE only" }),
+                Tokens::medium(11.5 * s),
+                t.text_faint,
+            );
             app.auto.add("motionLibrary.onMac", ar, "On the Mac");
         }
     }

@@ -90,6 +90,49 @@ pub struct Placeholder {
     pub fps: Option<f64>,
 }
 
+/// A rectangle of a thumbnail (pixels) and the size it was measured on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
+impl Crop {
+    /// The crop when it is usable (inside its source, not empty).
+    pub fn valid(self) -> Option<Crop> {
+        (self.width > 0
+            && self.height > 0
+            && self.source_width > 0
+            && self.source_height > 0
+            && self.x.saturating_add(self.width) <= self.source_width
+            && self.y.saturating_add(self.height) <= self.source_height)
+            .then_some(self)
+    }
+
+    /// The part of an image `w` × `h` this crop names: scaled when the image has the source's
+    /// shape at another size, none when its shape differs.
+    pub fn on(self, w: u32, h: u32) -> Option<[u32; 4]> {
+        let c = self.valid()?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (sx, sy) = (w as f64 / c.source_width as f64, h as f64 / c.source_height as f64);
+        if (sx / sy - 1.0).abs() > 0.02 {
+            return None;
+        }
+        let x = ((c.x as f64 * sx).floor() as u32).min(w - 1);
+        let y = ((c.y as f64 * sy).floor() as u32).min(h - 1);
+        let cw = ((c.width as f64 * sx).ceil() as u32).clamp(1, w - x);
+        let ch = ((c.height as f64 * sy).ceil() as u32).clamp(1, h - y);
+        Some([x, y, cw, ch])
+    }
+}
+
 /// One card of the catalog.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -134,6 +177,10 @@ pub struct Card {
     /// The thumbnail's width and height in pixels (cards keep its shape before it downloads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumb_size: Option<[u32; 2]>,
+    /// The visible artwork inside a transparent thumbnail (and its hover frames): cards show
+    /// this part, not the empty frame around it (the library's web panel's `thumbnail_crop`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Crop>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<BlobRef>,
     /// The `.ecproj` (`comp`) or the file (`footage`).
@@ -506,5 +553,20 @@ mod tests {
         assert_eq!(safe_name("../../etc/passwd"), "passwd");
         assert_eq!(safe_name(".."), "blob");
         assert_eq!(safe_name("a:b?.png"), "a_b_.png");
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::Crop;
+
+    #[test]
+    fn crops_scale_to_the_image_and_refuse_other_shapes() {
+        let c = Crop { x: 100, y: 400, width: 880, height: 300, source_width: 1080, source_height: 1920 };
+        assert_eq!(c.on(1080, 1920), Some([100, 400, 880, 300]));
+        assert_eq!(c.on(540, 960), Some([50, 200, 440, 150]));
+        assert_eq!(c.on(1920, 1080), None, "another shape");
+        assert_eq!(Crop { x: 900, ..c }.valid(), None, "outside its source");
+        assert_eq!(Crop::default().on(10, 10), None);
     }
 }

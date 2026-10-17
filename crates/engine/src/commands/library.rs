@@ -52,6 +52,8 @@ struct Entry {
     preview: String,
     /// A folder of PNG frames played on hover (the Motion Library's MotionEssence cards).
     frames: String,
+    /// The visible artwork inside a transparent thumbnail.
+    crop: Option<effectcraft_motionlib::Crop>,
 }
 
 /// A library folder, read.
@@ -107,6 +109,8 @@ pub struct LocalEntry {
     /// A folder of PNG frames to play on hover (the index's `frames`, else `Png` beside the
     /// thumbnail); may not exist.
     pub frames: String,
+    /// The visible artwork inside its transparent thumbnail and frames.
+    pub crop: Option<effectcraft_motionlib::Crop>,
     pub folder: String,
 }
 
@@ -156,6 +160,7 @@ pub(crate) fn local_entries(s: &Session) -> Arc<LocalIndex> {
                 } else {
                     resolve(&lib.folder, &e.frames)
                 },
+                crop: e.crop.and_then(effectcraft_motionlib::Crop::valid),
                 folder: lib.folder.clone(),
             });
         }
