@@ -383,12 +383,36 @@ impl Gpu {
             let inflight = ctx.enter_render();
             let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let internal = ctx.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
             // Some allocation failures (Adreno's ERROR_INITIALIZATION_FAILED) surface as
             // internal errors or mapped-at-creation panics, not OutOfMemory (#591).
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let invalid = pollster::block_on(validation.pop());
             let error = pollster::block_on(internal.pop()).or(pollster::block_on(scope.pop()));
+            // A texture or buffer whose allocation failed is invalid, and so is everything
+            // using it: those validation errors follow from the out-of-memory one, and the frame
+            // fails with it while the device lives on (CR1; uncaught, they retired the device).
+            // A validation error alone is a bug and retires the device, as uncaught ones do.
+            let error = match (error, invalid) {
+                // A resource whose allocation failed on another frame thread (an upload both
+                // use): what that thread's out-of-memory error left behind.
+                (None, Some(invalid)) if is_invalid_resource(&invalid) => Some(format!("out of memory before this frame: {invalid}")),
+                (None, Some(invalid)) => {
+                    let message = format!("uncaptured GPU error: {invalid}");
+                    log::error!("{message}");
+                    (ctx.device_failure_notifier())(message.clone());
+                    #[cfg(test)]
+                    #[allow(clippy::panic)]
+                    {
+                        panic!("{message}");
+                    }
+                    #[cfg(not(test))]
+                    Some(message)
+                }
+                (error, _) => error.map(|e| e.to_string()),
+            };
             let result = match (error, out) {
-                (Some(error), _) => Err(error.to_string()),
+                (Some(error), _) => Err(error),
                 (None, Ok(out)) => ctx.check_health().map(|()| out),
                 (None, Err(payload)) => {
                     let reason = payload
@@ -656,3 +680,11 @@ mod tests_motion_blur_accum;
 
 #[cfg(test)]
 mod tests_dispatch;
+
+/// A validation error about a resource that is invalid ("Buffer with 'data' label is
+/// invalid"): its creation failed, out of memory (CR1).
+#[cfg(not(target_arch = "wasm32"))]
+fn is_invalid_resource(e: &wgpu::Error) -> bool {
+    let text = format!("{e:?} {e}");
+    text.contains("is invalid")
+}

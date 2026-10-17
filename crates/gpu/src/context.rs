@@ -659,8 +659,14 @@ pub struct GpuContext {
     /// ([`crate::vram`]).
     discrete: bool,
     vram: Option<crate::vram::VideoMemory>,
+    /// The adapter (type, PCI vendor, device) and its video memory as last asked, when (see
+    /// [`GpuContext::live_video_memory`]).
+    adapter_ids: (wgpu::DeviceType, u32, u32),
+    vram_live: Arc<Mutex<Option<(web_time::Instant, crate::vram::VideoMemory)>>>,
+    vram_asking: Arc<std::sync::atomic::AtomicBool>,
     /// Out-of-memory backoff (CR1): renders in flight now, and at most how many after a render
     /// ran out of memory (`usize::MAX`: no limit yet). See [`GpuContext::max_inflight`].
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     inflight: Arc<std::sync::atomic::AtomicUsize>,
     inflight_ceiling: std::sync::atomic::AtomicUsize,
     /// Physical RAM in bytes (0: unknown; see [`GpuContext::set_system_memory`]).
@@ -739,10 +745,12 @@ fn storage_tex_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGro
 }
 
 /// Counts a render out of [`GpuContext::enter_render`]'s in-flight count.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) struct InflightGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 impl InflightGuard {
     /// Renders in flight now, this one included.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn in_flight(&self) -> usize {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1114,6 +1122,9 @@ impl GpuContext {
             integrated,
             discrete: info.device_type == wgpu::DeviceType::DiscreteGpu,
             vram,
+            adapter_ids: (info.device_type, info.vendor, info.device),
+            vram_live: Arc::new(Mutex::new(vram.map(|m| (web_time::Instant::now(), m)))),
+            vram_asking: Arc::default(),
             inflight: Arc::default(),
             inflight_ceiling: std::sync::atomic::AtomicUsize::new(usize::MAX),
             system_memory: std::sync::atomic::AtomicU64::new(0),
@@ -1151,6 +1162,30 @@ impl GpuContext {
         self.vram
     }
 
+    /// The discrete GPU's video memory now, as far as known: asked again in the background at
+    /// most every second (`nvidia-smi` takes a while), so the answer can be a second or two
+    /// old. Other programs (another EffectCraft) take and give back memory meanwhile (CR1).
+    pub fn live_video_memory(&self) -> Option<crate::vram::VideoMemory> {
+        self.vram?;
+        let latest = *self.vram_live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(not(target_arch = "wasm32"))]
+        if latest.is_none_or(|(t, _)| t.elapsed() >= std::time::Duration::from_secs(1))
+            && !self.vram_asking.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let (live, asking, (kind, vendor, device)) = (self.vram_live.clone(), self.vram_asking.clone(), self.adapter_ids);
+            let ask = move || {
+                if let Some(m) = crate::vram::query(kind, vendor, device) {
+                    *live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((web_time::Instant::now(), m));
+                }
+                asking.store(false, std::sync::atomic::Ordering::Release);
+            };
+            if std::thread::Builder::new().name("ec-vram".into()).spawn(ask).is_err() {
+                self.vram_asking.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        latest.map(|(_, m)| m).or(self.vram)
+    }
+
     /// Device memory wgpu's allocator holds for this device now, in bytes (Vulkan and Direct3D
     /// 12; `None` elsewhere). Walks every allocation: not for every dispatch.
     pub fn device_bytes(&self) -> Option<u64> {
@@ -1166,6 +1201,7 @@ impl GpuContext {
     }
 
     /// A render enters the device ([`GpuContext::max_inflight`]); the guard counts it out.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn enter_render(&self) -> InflightGuard {
         self.inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         InflightGuard(self.inflight.clone())
@@ -1173,6 +1209,7 @@ impl GpuContext {
 
     /// A render ran out of memory with `in_flight` renders on the device (itself included):
     /// at most half as many from now on.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn render_out_of_memory(&self, in_flight: usize) {
         let half = (in_flight / 2).max(1);
         let before = self.inflight_ceiling.fetch_min(half, std::sync::atomic::Ordering::AcqRel);

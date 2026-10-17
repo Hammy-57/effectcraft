@@ -4,13 +4,14 @@
 //! A frame's working set on the GPU (canvases, precomps, effect temporaries) can be ten times the
 //! four frame-sized buffers [`super::max_running`] estimates: sixteen 1080p frames at once filled
 //! a 20 GB card. So on a discrete GPU:
-//! - the frames share what was free of its video memory when the device was made, at most three
-//!   quarters of it ([`effectcraft_gpu::vram`]; 2 GiB when it is unknown), less what the device
-//!   holds with no frame rendering (caches, the texture pool);
+//! - a new frame starts while the card has room for it, keeping a tenth of it free: its video
+//!   memory as last asked of the driver, about every second, so another program taking memory
+//!   leaves fewer frames ([`effectcraft_gpu::vram`]; 2 GiB in all when it is unknown);
 //! - where wgpu reports the device's allocations (Vulkan, Direct3D 12), each finished frame
 //!   measures what the frames rendering took per frame, and the cap follows that;
-//! - the first frames start two at a time, then twice as many as have finished (a slow start), so
-//!   the measurement comes before many frames run at once;
+//! - until a frame has been measured, one is assumed to take a sixteenth of the card, and the
+//!   first frames start two at a time, one more for each that finished (a slow start), so the
+//!   measurement comes before many frames run at once;
 //! - each time the GPU runs out of memory, at most half as many frames as were rendering then
 //!   run from then on, also on a compositor that replaces a failed one.
 //!
@@ -71,7 +72,7 @@ impl Drop for Entered<'_> {
         // Paired with `enter`'s increment.
         if self.gate.rendering.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Nothing rendering: what the device holds now is the baseline.
-            if let Some(bytes) = self.gate.sample(&self.gpu) {
+            if let Some(bytes) = self.gate.sample(&self.gpu, true) {
                 self.gate.baseline.store(bytes, Ordering::Release);
             }
         }
@@ -89,17 +90,25 @@ impl Gate {
         if vram.is_none() && !ctx.discrete() {
             return None;
         }
-        let baseline = match self.baseline.load(Ordering::Acquire) {
-            u64::MAX => 0,
-            b => b,
-        };
-        // What was free when the device was made (another program may use the rest), less a
-        // quarter of the card for headroom, less what this device holds anyway.
-        let usable = vram.map_or(UNKNOWN_VRAM_BUDGET, |m| m.free.min(m.total / 4 * 3).saturating_sub(baseline).max(m.total / 16));
-        let per = (self.per_frame.load(Ordering::Acquire) as f64).max(frame).max(1.0);
-        let mut n = ((usable as f64 / per) as usize).clamp(1, threads.max(1));
+        let learned = self.per_frame.load(Ordering::Acquire);
+        // Until a frame has been measured, assume one takes a sixteenth of the card (heavy comps
+        // took about 1 GB a frame on a 24 GB card): the first frames never fill it at once.
+        let assumed = if learned == 0 { vram.map_or(0, |m| m.total / 16) } else { learned };
+        let per = (assumed as f64).max(frame).max(1.0);
+        let mut n = match ctx.live_video_memory() {
+            // The frames rendering now, and as many more as the room left on the card holds,
+            // keeping a tenth of it free (other programs, the driver): another program that
+            // takes memory (another EffectCraft on the same card) leaves fewer frames.
+            Some(m) => {
+                let room = m.free.saturating_sub(m.total / 10);
+                self.rendering.load(Ordering::Acquire).saturating_add((room as f64 / per) as usize)
+            }
+            None => (UNKNOWN_VRAM_BUDGET as f64 / per) as usize,
+        }
+        .clamp(1, threads.max(1));
         if self.measurable.load(Ordering::Acquire) != 2 {
-            n = n.min(self.finished.load(Ordering::Acquire).saturating_mul(2).max(2));
+            // One more frame at once for each one finished, from two.
+            n = n.min(self.finished.load(Ordering::Acquire).saturating_add(2));
         }
         Some(n.min(self.ceiling()))
     }
@@ -113,7 +122,7 @@ impl Gate {
     pub(crate) fn enter(&self, g: &Gpu) -> Entered<'_> {
         if self.baseline.load(Ordering::Acquire) == u64::MAX
             && self.rendering.load(Ordering::Acquire) == 0
-            && let Some(bytes) = self.sample(g)
+            && let Some(bytes) = self.sample(g, true)
         {
             self.baseline.store(bytes, Ordering::Release);
         }
@@ -126,7 +135,7 @@ impl Gate {
     pub(crate) fn finished(&self, e: &Entered<'_>) {
         self.finished.fetch_add(1, Ordering::AcqRel);
         let n = self.rendering.load(Ordering::Acquire).max(1) as u64;
-        let (Some(bytes), baseline) = (self.sample(&e.gpu), self.baseline.load(Ordering::Acquire)) else { return };
+        let (Some(bytes), baseline) = (self.sample(&e.gpu, false), self.baseline.load(Ordering::Acquire)) else { return };
         if baseline == u64::MAX {
             return;
         }
@@ -170,16 +179,16 @@ impl Gate {
         self.measurable.store(0, Ordering::Release);
     }
 
-    /// Device bytes now, at most every [`SAMPLE_EVERY`] (`None` between, or when the device
-    /// doesn't report them).
-    fn sample(&self, g: &Gpu) -> Option<u64> {
+    /// Device bytes now, at most every [`SAMPLE_EVERY`] unless `always` (`None` between, or
+    /// when the device doesn't report them).
+    fn sample(&self, g: &Gpu, always: bool) -> Option<u64> {
         if self.measurable.load(Ordering::Acquire) == 2 {
             return None;
         }
         {
             let mut last = self.last_sample.lock().unwrap_or_else(PoisonError::into_inner);
             let now = web_time::Instant::now();
-            if last.is_some_and(|t| now.duration_since(t) < SAMPLE_EVERY) && self.measurable.load(Ordering::Acquire) == 1 {
+            if !always && last.is_some_and(|t| now.duration_since(t) < SAMPLE_EVERY) && self.measurable.load(Ordering::Acquire) == 1 {
                 return None;
             }
             *last = Some(now);

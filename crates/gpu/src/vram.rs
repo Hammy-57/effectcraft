@@ -31,18 +31,27 @@ pub fn dedicated_memory(info: &wgpu::AdapterInfo) -> Option<VideoMemory> {
 }
 
 fn dedicated(device_type: wgpu::DeviceType, vendor: u32, device: u32) -> Option<VideoMemory> {
+    let found = query(device_type, vendor, device);
+    match found {
+        Some(m) => log::info!("gpu: {} MiB of video memory, {} MiB free", m.total >> 20, m.free >> 20),
+        None if device_type == wgpu::DeviceType::DiscreteGpu => {
+            log::info!("gpu: video memory unknown (vendor {vendor:#06x}); GPU frames keep a 2 GiB working budget")
+        }
+        None => {}
+    }
+    found
+}
+
+/// [`dedicated_memory`] without the log line (asked again while frames render, see
+/// [`crate::GpuContext::live_video_memory`]).
+pub(crate) fn query(device_type: wgpu::DeviceType, vendor: u32, device: u32) -> Option<VideoMemory> {
     if let Some(total) = std::env::var(VRAM_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| *mb > 0).and_then(|mb| mb.checked_mul(1 << 20)) {
         return Some(VideoMemory { total, free: total });
     }
     if device_type != wgpu::DeviceType::DiscreteGpu {
         return None;
     }
-    let found = detect(vendor, device);
-    match found {
-        Some(m) => log::info!("gpu: {} MiB of video memory, {} MiB free", m.total >> 20, m.free >> 20),
-        None => log::info!("gpu: video memory unknown (vendor {vendor:#06x}); GPU frames keep a 2 GiB working budget"),
-    }
-    found
+    detect(vendor, device)
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

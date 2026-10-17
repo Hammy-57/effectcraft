@@ -354,6 +354,11 @@ fn main() {
     if args.pos.is_empty() {
         fail_usage("missing subcommand");
     }
+    // Warnings (a GPU that ran out of memory, a fallback to the CPU) on standard error when
+    // asked for with RUST_LOG (`RUST_LOG=warn effectcraft-cli mcp --ui …`).
+    if std::env::var_os("RUST_LOG").is_some() {
+        effectcraft_engine::logging::install();
+    }
     // CR1: before any frame pool is made.
     match args.num("--frame-threads") {
         Ok(Some(n)) if n >= 1.0 && n.fract() == 0.0 => effectcraft_render::concurrency::set_frame_threads(n as usize),
