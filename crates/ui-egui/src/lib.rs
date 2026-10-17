@@ -2448,9 +2448,12 @@ impl EffectcraftApp {
         if self.playback.playing || ctx.input(|i| !i.events.is_empty()) {
             self.session.freeze_runtime.activity();
         }
+        freeze_hint::feed(self, &ctx);
         self.session.poll_freeze();
         if self.session.project.freeze.sections.iter().any(|s| s.auto && s.enabled) {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        } else if self.session.prefs.previews.freeze_auto_heavy {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         self.scrub_preview.tick(ctx.input(|i| i.time), self.session.active_comp_id().map(|id| id.0), self.session.revision);
         if let Some(wait) = self.scrub_preview.remaining() {

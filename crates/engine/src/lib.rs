@@ -1357,6 +1357,7 @@ impl Session {
         self.freeze_runtime.bad_versions.clear();
         self.freeze_runtime.reasons.clear();
         self.freeze_runtime.retry_after.clear();
+        self.freeze_runtime.cost.clear();
         self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
         p.fix_next_id();
         upgrade_effects(&mut p);
