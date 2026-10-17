@@ -38,8 +38,9 @@ fn timeout(p: &Value) -> std::time::Duration {
     std::time::Duration::from_secs_f64(f_p(p, "timeout").filter(|t| t.is_finite() && *t > 0.0).unwrap_or(WAIT).min(3600.0))
 }
 
-/// A card as lists show it.
-pub fn card_summary(c: &Card) -> Value {
+/// A card as lists show it, `local` when this machine has its files (a library folder: it
+/// applies from them, so it isn't "on the Mac" here).
+pub fn card_summary(c: &Card, local: bool) -> Value {
     let description: String = c.description.chars().take(240).collect();
     json!({
         "id": c.id,
@@ -51,14 +52,15 @@ pub fn card_summary(c: &Card) -> Value {
         "description": description,
         "duration": c.duration,
         "needsFootage": c.needs_footage(),
-        "onMac": c.on_mac,
+        "onMac": c.on_mac && !local,
+        "local": local,
         "source": "motion",
         "library": "Motion Library",
     })
 }
 
-fn card_detail(c: &Card) -> Value {
-    let mut v = card_summary(c);
+fn card_detail(c: &Card, local: bool) -> Value {
+    let mut v = card_summary(c, local);
     v["description"] = json!(c.description);
     v["comp"] = json!(c.comp);
     v["tags"] = json!(c.tags);
@@ -134,7 +136,7 @@ fn catalog(s: &mut Session, p: &Value) -> Result<Value> {
         "folders": folders,
         "total": hits.len(),
         "offset": offset,
-        "cards": hits.iter().skip(offset).take(limit).map(|c| card_summary(c)).collect::<Vec<_>>(),
+        "cards": hits.iter().skip(offset).take(limit).map(|c| card_summary(c, s.motion_library_local_entry(&c.id).is_some())).collect::<Vec<_>>(),
     }))
 }
 
@@ -143,7 +145,7 @@ fn card(s: &mut Session, p: &Value) -> Result<Value> {
     let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id`"))?;
     let (_, cat) = catalog_of(s, C, p)?;
     let c = cat.card(id).ok_or_else(|| bad(C, format!("no Motion Library card `{id}`")))?;
-    Ok(card_detail(c))
+    Ok(card_detail(c, s.motion_library_local_entry(id).is_some()))
 }
 
 /// Motion Library hits for `library.search` (best first), when the library is set up.
@@ -152,11 +154,14 @@ pub fn search_hits(s: &Session, query: &str, category: Option<&str>, kind: Optio
     let Some(cat) = client.catalog() else { return vec![] };
     effectcraft_motionlib::search(&cat.cards, query, "")
         .into_iter()
-        // Insertable cards only (on-the-Mac cards are listed by library.catalog).
-        .filter(|c| c.applicable())
         .filter(|c| kind.is_none_or(|k| c.kind.eq_ignore_ascii_case(k)))
         .filter(|c| category.is_none_or(|q| c.category.to_lowercase().contains(q)))
-        .map(card_summary)
+        // Insertable cards only: on-the-Mac cards are listed by library.catalog, unless this
+        // machine has their files.
+        .filter_map(|c| {
+            let local = s.motion_library_local_entry(&c.id).is_some();
+            (c.applicable() || local).then(|| card_summary(c, local))
+        })
         .collect()
 }
 
@@ -175,6 +180,13 @@ fn materialize(s: &Session, client: &Client, key: &str, bytes: impl FnOnce() -> 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "library.apply";
     let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a Motion Library card id, from library.catalog or library.search)"))?.to_string();
+    // The Mac that keeps the library applies the card's own files: nothing to download, and
+    // its footage stays linked (`remote: true` uses the bucket anyway).
+    if !b_p(p, "remote").unwrap_or(false)
+        && let Some(e) = s.motion_library_local_entry(&id)
+    {
+        return apply_local(s, p, &e);
+    }
     let (client, _) = catalog_of(s, C, p)?;
     #[cfg(not(target_arch = "wasm32"))]
     let prepared = if waits(p) { client.prepare_blocking(&id, timeout(p)) } else { client.prepare(&id) };
@@ -263,13 +275,45 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
                    "missing": !s.services.exists(&ph.path)})
         })
         .collect();
-    r["card"] = card_summary(&card);
+    r["card"] = card_summary(&card, false);
+    r["source"] = json!("remote");
     if !needs.is_empty() {
         r["needsFootage"] = json!(needs);
         r["hint"] = json!("Relink each missing item to this video's footage: footage.relink {item, path}");
         s.toast(format!("Applied “{}”: {} footage item{} to relink", card.name, needs.len(), if needs.len() == 1 { "" } else { "s" }));
     }
     Ok(r)
+}
+
+/// `library.reveal`: open the folder holding a card's file on this machine (a library folder).
+fn reveal(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "library.reveal";
+    let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a Motion Library card id)"))?;
+    let e = s.motion_library_local_entry(id).ok_or_else(|| bad(C, format!("`{id}` has no file on this machine (it comes from the Motion Library bucket)")))?;
+    let url = super::layer_menu::folder_url(&e.file);
+    s.events.push(crate::Event::OpenUrl(url.clone()));
+    Ok(json!({"url": url, "file": e.file}))
+}
+
+/// `library.apply` from a library folder (`library.insert`), one undo step.
+fn apply_local(s: &mut Session, p: &Value, e: &crate::motion_library::LocalEntry) -> Result<Value> {
+    let snap = s.project.clone();
+    let history = s.history.clone();
+    match s.execute("library.insert", p.clone()) {
+        Ok(mut r) => {
+            super::batch::fold(s, &snap, &format!("Apply {}", e.name));
+            r["source"] = json!("local");
+            r["file"] = json!(e.file);
+            Ok(r)
+        }
+        Err(err) => {
+            s.project = snap;
+            s.history = history;
+            s.sanitize_state();
+            s.bump();
+            Err(err)
+        }
+    }
 }
 
 fn configure(s: &mut Session, p: &Value) -> Result<Value> {
@@ -372,11 +416,23 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec {
             journal: false,
             ..cmd!(
+                "library.reveal",
+                "Reveal Motion Library Card in Finder",
+                [],
+                None,
+                "{id} → {url, file}: opens the folder of the card's file on this machine",
+                always,
+                reveal
+            )
+        },
+        CommandSpec {
+            journal: false,
+            ..cmd!(
                 "library.apply",
                 "Apply Motion Library Card",
                 [],
                 None,
-                "{id, comp? (default: the open composition; none open = import only), time? (s, default playhead), wait? (default true on desktop: download first; false returns {pending, done, total} until ready), timeout? (s)} — imports the card's project and nests its composition, one undo step → {item, layer, comp, card, import, needsFootage?: [{item, name, path, reason, duration, fps, missing}], hint?}. Relink needsFootage items with footage.relink {item, path}",
+                "{id, comp? (default: the open composition; none open = import only), time? (s, default playhead), wait? (default true on desktop: download first; false returns {pending, done, total} until ready), timeout? (s), remote? (true: from the bucket even when a library folder has the card)} — imports the card's project and nests its composition, one undo step; a card a library folder lists applies from those files (source \"local\") → {item, layer, comp, card, source, import, needsFootage?: [{item, name, path, reason, duration, fps, missing}], hint?}. Relink needsFootage items with footage.relink {item, path}",
                 always,
                 apply
             )
