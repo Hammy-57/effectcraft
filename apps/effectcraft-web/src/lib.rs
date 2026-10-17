@@ -36,9 +36,10 @@ pub mod browse;
 pub mod diskcache;
 #[cfg(target_arch = "wasm32")]
 pub mod files;
-// The Motion Library through the page's fetch.
 #[cfg(target_arch = "wasm32")]
 pub mod frames;
+// The Motion Library through the page's fetch.
+#[cfg(target_arch = "wasm32")]
 mod library;
 #[cfg(target_arch = "wasm32")]
 pub mod persist;
