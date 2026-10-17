@@ -1447,9 +1447,11 @@ version = "0.10.0"
 dependencies = [
  "effectcraft-engine",
  "effectcraft-host",
+ "effectcraft-media",
  "effectcraft-script",
  "getrandom 0.3.4",
  "image",
+ "rayon",
  "serde_json",
  "thiserror 2.0.21",
 ]
@@ -1481,6 +1483,7 @@ dependencies = [
  "effectcraft-time",
  "effectcraft-ui-egui",
  "image",
+ "rayon",
  "rustls-rustcrypto",
  "serde_json",
  "ureq",
@@ -1730,6 +1733,8 @@ dependencies = [
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
+ "filmcraft-h264",
+ "filmcraft-h264enc",
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-prores",
