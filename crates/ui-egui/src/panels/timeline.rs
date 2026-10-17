@@ -3195,10 +3195,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // The frame in the viewer's own time (kept with it while it is cached, as in After Effects),
     // else the last viewer frame's.
     let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
+    // A cloud frame (CR5) shows the server's time, and says so.
+    let cloud = shown_times.as_ref().is_some_and(|s| s.frame.remote);
     p.text(
         pos2(graph_x0 - 12.0, footer.center().y),
         Align2::RIGHT_CENTER,
-        crate::i18n::tr_args("Frame Render Time  {}ms", &[&format!("{ms:.0}")]),
+        crate::i18n::tr_args(if cloud { "Frame Render Time  {}ms (cloud)" } else { "Frame Render Time  {}ms" }, &[&format!("{ms:.0}")]),
         Tokens::ui(11.0),
         t.text_faint,
     );
@@ -3502,7 +3504,9 @@ fn layer_cells(
         let cp = lp.with_clip_rect(cr.intersect(lp.clip_rect()));
         cp.rect_filled(Rect::from_min_size(cr.min, vec2(bar_w.max(1.0), cr.height())), 1.0, colour.gamma_multiply(0.85));
         cp.text(pos2(cr.max.x, cy), Align2::RIGHT_CENTER, &label, Tokens::mono(11.0), t.text_dim);
-        app.auto.add(&format!("timeline.layer.{lid}.renderTime"), cr, &label);
+        // Scripts and tests read where the time was measured.
+        let auto_label = if times.frame.remote { format!("{label} (cloud)") } else { label };
+        app.auto.add(&format!("timeline.layer.{lid}.renderTime"), cr, &auto_label);
     }
     if cw.vis.comment {
         let cr = Rect::from_min_max(pos2(cw.comment + 4.0, r.min.y + 1.0), pos2(cw.comment + cw.comment_w - 4.0, r.max.y - 1.0));
