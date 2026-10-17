@@ -359,7 +359,7 @@ and ScriptUI lifecycle callbacks; opening uses the existing panel creation comma
 
 ## Frame channel
 
-`effectcraft-cli serve --frames PORT [--gpu] [--frame-threads N] [--token T]` also serves viewer
+`effectcraft-cli serve --frames PORT [--gpu] [--token T]` also serves viewer
 frames to a desktop app that renders in the cloud (a rented GPU). It listens on 127.0.0.1 only:
 reach it through an SSH tunnel (`ssh -L 9878:127.0.0.1:9878 …`). Frames need a binary channel
 next to the JSON lines, so each message is one length-prefixed frame
@@ -377,8 +377,8 @@ next to the JSON lines, so each message is one length-prefixed frame
   `render`, `segs`, `purge`). The app is the source of truth: each connection holds a replica of
   its project and only renders it. Replies are `{"type":"reply","reply":…,"pixels":…}` with a
   `FrameReply`; a frame's pixels are the payload.
-- Render requests queue for a pool of workers (`--frame-threads`, `EFFECTCRAFT_FRAME_THREADS`,
-  default 8): urgent first (the newest first), then prefetch (the oldest first), then lossless
+- Render requests queue for a pool of workers (8, capped by `--frame-threads` /
+  `EFFECTCRAFT_FRAME_THREADS`; one frame on the GPU at a time, `EFFECTCRAFT_FRAME_GPU_SLOTS`): urgent first (the newest first), then prefetch (the oldest first), then lossless
   refines. `{"type":"cancel","ids":[…]}` drops requests. A request for another revision than the
   replica's, also one that turned old while it rendered, answers `failed` with `stale: true`.
 - `want`: `codec` `jpeg` (scrubbing; quality 85 by default; strips of 64 rows, each its own JPEG,

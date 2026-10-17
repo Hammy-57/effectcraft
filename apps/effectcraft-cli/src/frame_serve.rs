@@ -210,15 +210,10 @@ fn cache_budget() -> usize {
     std::env::var("EFFECTCRAFT_FRAME_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1 << 20)
 }
 
-/// Frame workers: `--frame-threads`, else `EFFECTCRAFT_FRAME_THREADS`, else 8.
-fn threads(args: &Args) -> Result<usize, Failure> {
-    let raw = args.opt("--frame-threads").map(str::to_string).or_else(|| std::env::var("EFFECTCRAFT_FRAME_THREADS").ok());
-    match raw {
-        Some(v) => {
-            v.trim().parse::<usize>().ok().filter(|n| (1..=256).contains(n)).ok_or_else(|| Failure::Usage(format!("--frame-threads: `{v}` is not 1–256")))
-        }
-        None => Ok(frame_server::DEFAULT_THREADS),
-    }
+/// Frame workers: 8, capped by `--frame-threads` / `EFFECTCRAFT_FRAME_THREADS` (CR1's
+/// [`effectcraft_render::concurrency`]).
+fn threads() -> usize {
+    effectcraft_render::concurrency::frame_threads(frame_server::DEFAULT_THREADS)
 }
 
 /// Start the frame server for `serve`. `gpu`: the device the host shares; `control_port`: the
@@ -242,7 +237,7 @@ pub fn start(args: &Args, port: u16, gpu: Option<Arc<Gpu>>, control_port: Arc<On
         }
         _ => None,
     };
-    let threads = threads(args)?;
+    let threads = threads();
     let cache = Arc::new(LayerCache::new(cache_budget()));
     if let Some(g) = &gpu {
         g.context().set_cache_budget(cache.budget());

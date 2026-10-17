@@ -147,7 +147,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
-  serve [F.ecproj | --demo] [--control PORT] [--gpu] [--frames PORT [--frame-threads N] [--token T]]
+  serve [F.ecproj | --demo] [--control PORT] [--gpu] [--frames PORT [--token T]]
                                            a windowless host: one project that several agents work on at
                                            once over the control channel (join with mcp --bridge PORT or
                                            the MCP hosts tool); prints the port; checkpoints unsaved work;
@@ -199,7 +199,6 @@ const VALUED: &[&str] = &[
     "--code",
     // serve --frames / frames-bench
     "--frames",
-    "--frame-threads",
     "--token",
     "--duration",
     // compare
