@@ -81,6 +81,7 @@ impl Cache {
         }
         let Some(img) = self.map.remove(&from) else { return };
         self.map.insert(to, img);
+        self.move_draft(&from, to);
         self.order.rename(&from, to);
         if let Some(rank) = self.protected.remove(&from) {
             self.protected.insert(to, rank);
@@ -92,12 +93,18 @@ impl Cache {
     /// Make the cached frame that shows `print` at `key`'s place the frame of `key`: whether
     /// `key` is cached now.
     pub(super) fn adopt(&mut self, key: FrameKey, print: u64) -> bool {
-        if self.map.contains_key(&key) {
+        // A draft of the cloud's stream under the key gives way to an exact frame.
+        let draft = self.drafts.contains(&key);
+        if self.map.contains_key(&key) && !draft {
             return true;
         }
         let Some(from) = self.prints.by.get(&print_key(&key, print)).copied() else { return false };
-        if !self.map.contains_key(&from) {
+        if from == key || !self.map.contains_key(&from) {
             return false;
+        }
+        if draft {
+            self.order.remove(&key);
+            self.remove(&key);
         }
         self.rename(from, key);
         self.map.contains_key(&key)

@@ -973,8 +973,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Frame.
     let scale = app.viewer_scale(zoom, ppp);
     if !app.playback.playing {
-        // Queue the frame on screen before any prefetch.
-        app.request_frame_urgent(cid, comp.frame_rate.frame_at(app.session.time()), scale);
+        // Queue the frame on screen before any prefetch (exact: not a draft of the cloud's stream).
+        app.request_frame_exact(cid, comp.frame_rate.frame_at(app.session.time()), scale);
     }
     crate::tick_playback(app, &ctx, scale);
     let time = app.session.time();

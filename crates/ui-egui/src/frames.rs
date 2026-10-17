@@ -42,6 +42,8 @@ mod landing;
 mod property_reuse;
 #[cfg(not(target_arch = "wasm32"))]
 mod resident;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod streamed;
 pub mod times;
 mod vram;
 #[cfg(not(target_arch = "wasm32"))]
@@ -243,12 +245,17 @@ struct Cache {
     /// Frame fingerprints ([`fingerprint`]): what each cached frame shows, and the frame
     /// that shows it.
     prints: fingerprint::Prints,
+    /// Draft frames ([`streamed`]): below-full-size frames of the cloud's playback stream,
+    /// cached under the viewer's key. Playback shows them; the paused viewer renders the exact
+    /// frame over one, and any other frame stored under the key replaces it.
+    drafts: HashSet<FrameKey>,
 }
 
 impl Cache {
     fn insert(&mut self, k: FrameKey, img: FrameImage) {
         self.generation = self.generation.wrapping_add(1);
         let (sz, gpu) = (img.bytes(), img.is_gpu());
+        self.drafts.remove(&k);
         if let Some(old) = self.map.insert(k, img) {
             self.forget(&old);
         } else {
@@ -285,11 +292,18 @@ impl Cache {
             self.generation = self.generation.wrapping_add(1);
             self.forget(&i);
         }
+        self.drafts.remove(k);
         self.prints.remove(k);
     }
     /// Shown again: last in line for eviction.
     fn touch(&mut self, k: &FrameKey) {
         self.order.touch(k);
+    }
+    /// The frame of `from` is known as `to` from now on: a draft stays a draft.
+    fn move_draft(&mut self, from: &FrameKey, to: FrameKey) {
+        if self.drafts.remove(from) {
+            self.drafts.insert(to);
+        }
     }
     /// Drop every frame of the identities in `gone`. A frame with a fingerprint stays, under an
     /// identity no project is given (the address of a comp its identity hashed may be reused
@@ -306,6 +320,7 @@ impl Cache {
                 && let Some(img) = self.map.remove(k)
             {
                 self.map.insert(orphan, img);
+                self.move_draft(k, orphan);
                 if let Some(rank) = self.protected.remove(k) {
                     self.protected.insert(orphan, rank);
                 }
@@ -718,7 +733,7 @@ impl Default for Frames {
         let threads = effectcraft_engine::render::concurrency::frame_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         let gpu_gate = Arc::new(vram::Gate::default());
         Frames {
-            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0, prints: fingerprint::Prints::default() })),
+            cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: Order::default(), protected: HashMap::new(), playhead: None, bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET, generation: 0, prints: fingerprint::Prints::default(), drafts: HashSet::new() })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             failed: Failed::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1213,14 +1228,6 @@ impl Frames {
         self.cache.lock().map(|c| c.map.contains_key(k)).unwrap_or(false)
     }
 
-    /// A frame from the cloud's playback stream (CR6b, [`crate::cloud_stream`]): cached under
-    /// `k` as it is (a half- or quarter-size frame shows scaled up).
-    pub fn insert_streamed(&self, k: FrameKey, img: Arc<egui::ColorImage>) {
-        if let Ok(mut c) = self.cache.lock() {
-            c.insert(k, FrameImage::Cpu(img));
-        }
-    }
-
     /// Take one frame out of the RAM cache (a stream's low-resolution or stale frame).
     pub fn remove_frame(&self, k: &FrameKey) {
         if let Ok(mut c) = self.cache.lock()
@@ -1440,6 +1447,7 @@ impl Frames {
         self.times.clear();
         if let Ok(mut c) = self.cache.lock() {
             c.map.clear();
+            c.drafts.clear();
             c.prints = fingerprint::Prints::default();
             c.generation = c.generation.wrapping_add(1);
             c.order.clear();
@@ -1464,12 +1472,18 @@ impl Frames {
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
     pub fn request(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, false);
+        self.request_with(src, key, comp, t, opts, false, false);
     }
 
     /// Queue the frame the viewer is showing: it jumps ahead of every prefetch job.
     pub fn request_urgent(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
-        self.request_with(src, key, comp, t, opts, true);
+        self.request_with(src, key, comp, t, opts, true, false);
+    }
+
+    /// [`Frames::request_urgent`] for the paused viewer: a draft frame of the cloud's stream
+    /// ([`streamed`]) under the key is rendered exactly too (and replaced when it lands).
+    pub fn request_exact(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts) {
+        self.request_with(src, key, comp, t, opts, true, true);
     }
 
     /// An urgent (viewer) frame is queued or rendering.
@@ -1532,8 +1546,9 @@ impl Frames {
         true
     }
 
-    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
-        if self.is_cached(&key) || self.failed(&key) {
+    fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool, over_draft: bool) {
+        let cached = if over_draft { self.is_exact(&key) } else { self.is_cached(&key) };
+        if cached || self.failed(&key) {
             return;
         }
         // After an edit, the frames it didn't change are found again by their fingerprints.
@@ -1936,7 +1951,11 @@ impl Worker {
             // A cached frame with the same fingerprint (one the last edit didn't change, the
             // state an undo returns to) is shown instead of rendering the frame again.
             job.print = fingerprint::of(&job.src, job.comp, job.t, job.opts);
-            if self.cache.lock().is_ok_and(|mut c| c.map.contains_key(&job.key) || job.print.is_some_and(|p| c.adopt(job.key, p))) {
+            if self
+                .cache
+                .lock()
+                .is_ok_and(|mut c| (c.map.contains_key(&job.key) && !c.drafts.contains(&job.key)) || job.print.is_some_and(|p| c.adopt(job.key, p)))
+            {
                 self.release(job.key, job.urgent);
                 return true;
             }
@@ -3793,7 +3812,7 @@ mod tests {
             gpu_display: false,
             disk: None,
         };
-        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent);
+        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent, false);
         let other = FrameKey { comp: 2, ..key(1, 0, 0) };
         request(other, true);
         request(key(1, 20, 0), false);

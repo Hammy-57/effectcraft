@@ -1,10 +1,10 @@
 //! CR6b: the playback stream's buffer (no network): chunks in and out of order, a late chunk,
-//! adaptive resolution, edits while playing.
+//! adaptive resolution, edits while playing. CR6c: drafts stay, runs of missing frames.
 #![cfg(all(test, not(target_arch = "wasm32")))]
 
 use std::sync::Arc;
 
-use crate::cloud_stream::{ChunkMeta, StreamBuffer};
+use crate::cloud_stream::{ChunkMeta, StreamBuffer, missing_run};
 use crate::frames::FrameKey;
 
 /// A 2×2 frame whose red channel says which copy it is.
@@ -17,12 +17,13 @@ fn chunk(seq: u64, revision: u64, first: i64, frames: u32, scale: f32, tag: u8) 
     (ChunkMeta { seq, revision, first, frames, scale }, (0..frames).map(|_| img(tag, side)).collect())
 }
 
-fn series(content: u64) -> FrameKey {
-    FrameKey { revision: content, content, comp: 1, frame: 0, scale: 1000, view: 0, opts: 0 }
+/// The viewer's frames of comp content `content` at project revision `revision`.
+fn series(content: u64, revision: u64) -> FrameKey {
+    FrameKey { revision, content, comp: 1, frame: 0, scale: 1000, view: 0, opts: 0 }
 }
 
 fn tag_of(b: &mut StreamBuffer, s: &FrameKey, f: i64) -> Option<u8> {
-    b.publish(s).into_iter().find(|(k, _)| k.frame == f).map(|(_, i)| i.pixels[0].r())
+    b.publish(s).into_iter().find(|p| p.key.frame == f).map(|p| p.img.pixels[0].r())
 }
 
 #[test]
@@ -49,7 +50,7 @@ fn chunks_in_order_and_out_of_order_land_with_the_newest_copy_winning() {
     b.insert(m, i, 15.0);
     let (m, i) = chunk(5, 1, 60, 15, 0.25, 21);
     b.insert(m, i, 15.0);
-    let s = series(7);
+    let s = series(7, 1);
     assert_eq!(tag_of(&mut b, &s, 60), Some(20));
     assert_eq!(b.stats.quarter, 0, "the late quarter copy was no first copy");
 }
@@ -83,28 +84,56 @@ fn a_late_chunk_is_counted_and_passed_frames_are_let_go() {
 }
 
 #[test]
-fn low_resolution_frames_show_until_the_full_copy_and_leave_the_cache_on_stop() {
+fn low_resolution_frames_are_drafts_until_the_full_copy_and_stay_on_stop() {
     let mut b = StreamBuffer::new(0, (0, 299, false), 1000);
     let (m, i) = chunk(1, 1, 0, 15, 0.5, 1);
     b.insert(m, i, 10.0);
-    let s = series(3);
+    let s = series(3, 1);
     let out = b.publish(&s);
     assert_eq!(out.len(), 15);
-    assert_eq!(out[0].1.size, [2, 2], "a half frame is cached as it is, under the viewer's key");
-    assert_eq!(out[0].0, FrameKey { frame: 0, ..s });
+    assert_eq!(out[0].img.size, [2, 2], "a half frame is cached as it is, under the viewer's key");
+    assert_eq!(out[0].key, FrameKey { frame: 0, ..s });
+    assert!(out.iter().all(|p| p.draft && p.current), "a draft, and current (it goes to the disk cache)");
     assert!(b.publish(&s).is_empty(), "published once");
     // The full-size copy replaces it.
     let (m, i) = chunk(2, 1, 0, 15, 1.0, 2);
     b.insert(m, i, 10.0);
     assert_eq!(b.stats.upgrades, 1);
-    assert_eq!(tag_of(&mut b, &s, 0), Some(2));
-    // Frames 15–29 at quarter size stay low: those are what the stop takes out.
+    let out = b.publish(&s);
+    assert!(out.iter().all(|p| !p.draft && p.current && p.img.pixels[0].r() == 2));
+    // Frames 15–29 at quarter size stay low: drafts, kept when the preview stops (CR6c).
     let (m, i) = chunk(3, 1, 15, 15, 0.25, 3);
     b.insert(m, i, 10.0);
-    b.publish(&s);
-    let mut dirty: Vec<i64> = b.take_dirty().into_iter().map(|k| k.frame).collect();
-    dirty.sort_unstable();
-    assert_eq!(dirty, (15..30).collect::<Vec<_>>());
+    assert!(b.publish(&s).iter().all(|p| p.draft));
+    assert!(b.take_dirty(1).is_empty(), "pausing keeps the drafts");
+}
+
+#[test]
+fn pausing_right_after_an_edit_takes_out_the_frames_the_server_hasnt_answered_for() {
+    let mut b = StreamBuffer::new(0, (0, 299, false), 1000);
+    let (m, i) = chunk(1, 1, 0, 15, 1.0, 1);
+    b.insert(m, i, 10.0);
+    b.publish(&series(5, 1));
+    // An edit (revision 2, new content key) before the server's `stale` notice: they show
+    // (drafts), but may be old, so a stop takes them out.
+    let out = b.publish(&series(6, 2));
+    assert!(out.iter().all(|p| p.draft && !p.current));
+    assert_eq!(b.take_dirty(2).len(), 15);
+    // Once the server answered (frames before 20 didn't change), they stay.
+    b.mark_stale(2, 20);
+    b.publish(&series(7, 2));
+    assert!(b.take_dirty(2).is_empty());
+}
+
+#[test]
+fn a_stream_plays_the_first_run_of_missing_frames() {
+    let order: Vec<i64> = (10..20).chain(0..5).collect();
+    let held = |f: i64| !(12..15).contains(&f) && f != 2;
+    assert_eq!(missing_run(&order, held), Some((12, 14)));
+    // Up to the end of the range: the wrap starts a run of its own.
+    let held = |f: i64| f < 18 && f != 0 && f != 1;
+    assert_eq!(missing_run(&order, held), Some((18, 19)));
+    assert_eq!(missing_run(&order, |_| true), None, "everything held: no stream");
 }
 
 #[test]
@@ -114,7 +143,7 @@ fn an_edit_marks_frames_stale_and_the_new_revision_replaces_them() {
         let (m, i) = chunk(k + 1, 1, k as i64 * 15, 15, 1.0, 1);
         b.insert(m, i, 10.0);
     }
-    let before = series(100);
+    let before = series(100, 1);
     b.publish(&before);
     // The edit (revision 2) changes frames from 20 on.
     b.mark_stale(2, 20);
@@ -124,10 +153,11 @@ fn an_edit_marks_frames_stale_and_the_new_revision_replaces_them() {
     b.insert(m, i, 10.0);
     assert!(b.has(60) && !b.fresh(60));
     // The comp's content key changed: every frame is published again under it.
-    let after = series(200);
+    let after = series(200, 2);
     let out = b.publish(&after);
     assert_eq!(out.len(), b.len());
-    assert!(out.iter().all(|(k, _)| k.content == 200));
+    assert!(out.iter().all(|p| p.key.content == 200));
+    assert!(out.iter().all(|p| p.draft && !p.current), "frames of revision 1 under revision 2's key: drafts, never on disk");
     // New chunks of revision 2 replace the stale frames, even an older sequence number would not
     // undo that.
     let (m, i) = chunk(6, 2, 30, 15, 1.0, 9);
@@ -138,7 +168,7 @@ fn an_edit_marks_frames_stale_and_the_new_revision_replaces_them() {
     b.insert(m, i, 10.0);
     assert!(b.fresh(30), "an old copy never replaces a current one");
     // The stale copies are taken out of the cache when the preview stops; the fresh ones stay.
-    let dirty: Vec<FrameKey> = b.take_dirty();
+    let dirty: Vec<FrameKey> = b.take_dirty(2);
     assert!(dirty.iter().any(|k| k.frame == 20 && k.content == 200));
     assert!(!dirty.iter().any(|k| k.frame == 30 && k.content == 200));
     assert_eq!(b.stats.stale, 1);
