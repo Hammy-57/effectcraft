@@ -3300,7 +3300,7 @@ static INDEX_DONE: Mutex<usize> = Mutex::new(0);
 /// One at a time, and skipped when a rebuild that started after this change already ran (parallel
 /// rebuilds raced: an older one finishing last wrote a stale index).
 #[cfg(not(target_arch = "wasm32"))]
-fn reindex_library() {
+pub(crate) fn reindex_library() {
     let mine = INDEX_ASKED.fetch_add(1, Ordering::SeqCst).saturating_add(1);
     let mut done = INDEX_DONE.lock().unwrap_or_else(|e| e.into_inner());
     if *done >= mine {
@@ -3318,7 +3318,7 @@ fn reindex_library() {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn reindex_library() {}
+pub(crate) fn reindex_library() {}
 
 /// What a finished operation changes in the panel right away (before the index has it).
 pub(crate) enum FolderChange {
