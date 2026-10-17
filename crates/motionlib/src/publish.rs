@@ -43,6 +43,9 @@ pub struct Options {
     /// List every other library entry too, with its thumbnail only ([`Card::on_mac`]): entries
     /// outside `folders`, and the index's `catalog_only` ones (what EffectCraft can't apply).
     pub catalog_all: bool,
+    /// Entries published in full wherever they are (a card saved from the panel). Cards a
+    /// previous publish had in full stay so ("saved" cards keep their files).
+    pub ids: Vec<String>,
     /// Work everything out, upload nothing.
     pub dry_run: bool,
     /// Upload every blob again (a remote that lost files).
@@ -59,6 +62,7 @@ impl Options {
             folder_max_bytes: vec![],
             include_video: false,
             catalog_all: false,
+            ids: vec![],
             dry_run: false,
             force: false,
         }
@@ -502,9 +506,17 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
         return Err("no folders to publish".into());
     }
     let listed = |key: &str| index.get(key).and_then(Value::as_array).map(|a| a.iter().collect::<Vec<_>>()).unwrap_or_default();
+    let previous = current(remote)?;
+    // Saved cards: asked for now, or published in full before (outside the folders too).
+    let saved: BTreeSet<String> = opts
+        .ids
+        .iter()
+        .cloned()
+        .chain(previous.iter().flat_map(|(_, m)| m.cards.iter().filter(|c| !c.on_mac && c.project.is_some()).map(|c| c.id.clone())))
+        .collect();
     let in_folders = |e: &Value| {
         let cat = text(e, "category");
-        folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
+        saved.contains(text(e, "id").as_str()) || folders.iter().any(|f| cat == *f || cat.strip_prefix(f.as_str()).is_some_and(|r| r.starts_with('/')))
     };
     let applicable = |e: &Value| matches!(e.get("kind").and_then(Value::as_str), Some("comp" | "footage"));
     let entries: Vec<&Value> = listed("entries").into_iter().filter(|e| applicable(e) && in_folders(e)).collect();
@@ -526,7 +538,6 @@ pub fn publish(remote: &dyn Remote, opts: &Options, progress: &mut dyn FnMut(Str
         if opts.catalog_all { format!(", {} listed only", mac_entries.len()) } else { String::new() }
     ));
 
-    let previous = current(remote)?;
     let mut b = Builder { opts, hasher: Hasher::open(&opts.library), uploads: BTreeMap::new(), report: Report { dry_run: opts.dry_run, ..Report::default() } };
     let mut cards = Vec::new();
     for (i, e) in entries.iter().enumerate() {

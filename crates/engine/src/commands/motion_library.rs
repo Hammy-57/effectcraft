@@ -381,6 +381,92 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(v)
 }
 
+/// Uploads above this many MB wait for `confirm: true` (Elias's internet is metered).
+const ASK_ABOVE_MB: f64 = 50.0;
+
+/// `library.saveCard`: upload one card from this Mac's library folder to the bucket (the
+/// catalog's own folders and limits; video and big files stay home), in the background. A dry
+/// run first: over `askAboveMB` it stops with `needsConfirm` and the size.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_card(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "library.saveCard";
+    let id = str_p(p, "id").ok_or_else(|| bad(C, "missing `id` (a card in this Mac's library folder)"))?.to_string();
+    let e = s
+        .motion_library_local_entry(&id)
+        .ok_or_else(|| bad(C, format!("`{id}` isn't in a library folder on this machine: cards are saved from the Mac that keeps the library")))?;
+    let cfg = s.motion_library_config();
+    if cfg.remote.is_empty() || cfg.token.is_empty() {
+        return Err(bad(C, "the Motion Library isn't set up for saving here (no remote or token in motion-library.json)"));
+    }
+    let remote = effectcraft_motionlib::remote_for(&cfg.remote, Some(&cfg.token)).map_err(|e| bad(C, e))?;
+    let client = s.motion_library().ok();
+    // The published catalog's settings, so the save changes nothing else.
+    let cat = client.as_ref().and_then(Client::catalog);
+    let folders = cat.as_ref().map(|c| c.folders.clone()).filter(|f| !f.is_empty()).unwrap_or_else(|| vec!["Devin Jatho".into(), "SceneYard".into()]);
+    let mut opts = effectcraft_motionlib::publish::Options::new(&e.folder, folders);
+    opts.ids = vec![id.clone()];
+    opts.catalog_all = cat.as_ref().is_some_and(|c| c.cards.iter().any(|c| c.on_mac));
+    // The Mac publish script's limits (option C): small previews, SceneYard files up to 20 MB.
+    opts.max_preview_bytes = (f_p(p, "maxPreviewMB").filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(2.0) * 1e6) as u64;
+    opts.folder_max_bytes = match p.get("folderMaxMB").and_then(Value::as_object) {
+        Some(map) => map.iter().filter_map(|(f, mb)| Some((f.clone(), (mb.as_f64().filter(|m| m.is_finite() && *m >= 0.0)? * 1e6) as u64))).collect(),
+        None => vec![("SceneYard".into(), 20_000_000)],
+    };
+    let dry = b_p(p, "dryRun").unwrap_or(false);
+    let confirm = b_p(p, "confirm").unwrap_or(false);
+    let ask = f_p(p, "askAboveMB").filter(|m| m.is_finite() && *m >= 0.0).unwrap_or(ASK_ABOVE_MB);
+    let name = e.name.clone();
+    s.spawn_task("librarySave", format!("Saving “{name}” to the library"), b_p(p, "wait").unwrap_or(false), move |ctl| {
+        ctl.message("working out what to upload");
+        let mut plan = opts.clone();
+        plan.dry_run = true;
+        let r = effectcraft_motionlib::publish::publish(remote.as_ref(), &plan, &mut |line| ctl.message(line))?;
+        let mb = r.upload_bytes as f64 / 1e6;
+        // What stays home (video, too large), for this card.
+        let skipped: Vec<Value> = r
+            .skipped
+            .iter()
+            .filter(|k| k.card == name)
+            .map(|k| json!({"file": k.path.rsplit('/').next().unwrap_or(&k.path), "size": k.size, "reason": k.reason}))
+            .collect();
+        let skipped_text = if skipped.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> =
+                skipped.iter().take(3).map(|k| format!("{} ({})", k["file"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""))).collect();
+            format!("; left at home: {}{}", names.join(", "), if skipped.len() > 3 { format!(" and {} more", skipped.len() - 3) } else { String::new() })
+        };
+        let base = json!({"id": id, "name": name, "uploadMB": (mb * 10.0).round() / 10.0, "uploads": r.uploads, "skipped": skipped});
+        if dry || (mb > ask && !confirm) {
+            let mut out = base;
+            out["dryRun"] = json!(dry);
+            out["needsConfirm"] = json!(!dry);
+            out["toast"] = json!(if dry {
+                format!("Saving “{name}” would upload {mb:.1} MB{skipped_text}")
+            } else {
+                format!("“{name}” is {mb:.1} MB to upload: confirm to save it{skipped_text}")
+            });
+            return Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply);
+        }
+        ctl.message(format!("uploading {mb:.1} MB"));
+        let done = effectcraft_motionlib::publish::publish(remote.as_ref(), &opts, &mut |line| ctl.message(line))?;
+        // This session sees the saved card right away.
+        if let Some(c) = &client {
+            c.refresh_blocking(std::time::Duration::from_secs(60));
+            c.adopt_update();
+        }
+        let mut out = base;
+        out["version"] = json!(done.version);
+        out["toast"] = json!(format!("Saved “{name}” to the library ({mb:.1} MB uploaded, version {}){skipped_text}", done.version));
+        Ok(Box::new(move |_: &mut Session| Ok(out)) as super::super::jobs::Apply)
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_card(_: &mut Session, _: &Value) -> Result<Value> {
+    Err(bad("library.saveCard", "cards are saved from the Mac that keeps the library"))
+}
+
 #[cfg(target_arch = "wasm32")]
 fn publish(_: &mut Session, _: &Value) -> Result<Value> {
     Err(bad("library.publish", "publishing runs on the Mac that keeps the library"))
@@ -455,5 +541,17 @@ pub fn specs() -> Vec<CommandSpec> {
             "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), catalogAll? (also list every other entry with its thumbnail only: applied on the Mac), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, onMac, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
             publish
         ),
+        CommandSpec {
+            journal: false,
+            ..cmd!(
+                "library.saveCard",
+                "Save Card to Motion Library",
+                [],
+                None,
+                "{id (a card in this Mac's library folder), confirm? (upload even above askAboveMB), askAboveMB? (default 50), dryRun?, wait?, maxPreviewMB? (default 2), folderMaxMB? (default {\"SceneYard\": 20})} — desktop, in the background: uploads the card's files (video and big files stay home) and a new catalog version; it stays saved in later publishes → {job}; the job's result: {id, name, uploadMB, uploads, skipped: [{file, size, reason}], needsConfirm?, version?}",
+                always,
+                save_card
+            )
+        },
     ]
 }
