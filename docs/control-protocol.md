@@ -318,7 +318,8 @@ renders the same at roundness 0; solids with effects, adjustment layers and othe
 could not render the same are refused with the reason),
 `shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
-shape paths by uid), `keys.setSpatialTangents` (motion-path handles) and `keys.transform` (Graph
+shape paths by uid), `keys.setSpatialTangents` (motion-path handles), `keys.bendSpatialSegment`
+(bend the motion path between two keys by their tangents, no key added) and `keys.transform` (Graph
 Editor transform box, timeline Alt-drag scaling).
 
 The MCP server's bridge mode (`effectcraft-cli mcp --bridge 9877`) is a thin client of this protocol;

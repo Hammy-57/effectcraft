@@ -3,7 +3,7 @@
 //! handles, the path free-transform box and the Mask Feather tool.
 //!
 //! Every edit is an engine command (`mask.*`, `path.freeTransform`, `keys.set`,
-//! `keys.setSpatialTangents`, `prop.set`).
+//! `keys.setSpatialTangents`, `keys.bendSpatialSegment`, `prop.set`).
 
 use effectcraft_engine::geom::{Mat3, vec2 as gv2};
 use effectcraft_engine::keyframe::ShapePath;
@@ -288,6 +288,8 @@ pub(crate) struct MotionSegment {
     pub to: Pos2,
     pub start: Tick,
     pub end: Tick,
+    /// Parent space → comp.
+    pub p2c: Mat3,
 }
 
 pub(crate) fn motion_key_at(hits: &[KeyHit], pos: Pos2) -> Option<KeyHit> {
@@ -318,6 +320,24 @@ const PEN_KEY_R: f32 = 6.0;
 const PEN_TANGENT_R: f32 = 5.0;
 const PEN_PATH_R: f32 = 6.0;
 
+/// The displayed sample interval nearest `pos` (within the path's pick radius), and how far
+/// along it the pointer is.
+fn segment_near(segments: &[MotionSegment], pos: Pos2) -> Option<(&MotionSegment, f32)> {
+    segments
+        .iter()
+        .filter_map(|s| {
+            let delta = s.to - s.from;
+            if delta.length_sq() < 0.001 {
+                return None;
+            }
+            let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
+            let d = pos.distance(s.from + delta * f);
+            (d < PEN_PATH_R).then_some((s, f, d))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(s, f, _)| (s, f))
+}
+
 /// The [`PenTarget`] at `pos`: a key square first, then a tangent handle, then the path line.
 pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[PathFrame], pos: Pos2) -> PenTarget {
     let nearest = |tangent: bool, r: f32| {
@@ -332,21 +352,7 @@ pub(crate) fn pen_target(hits: &[KeyHit], segments: &[MotionSegment], frames: &[
     if nearest(true, PEN_TANGENT_R).is_some() {
         return PenTarget::Tangent;
     }
-    // The nearest displayed sample interval, and how far along it the pointer is.
-    let Some((seg, f)) = segments
-        .iter()
-        .filter_map(|s| {
-            let delta = s.to - s.from;
-            if delta.length_sq() < 0.001 {
-                return None;
-            }
-            let f = ((pos - s.from).dot(delta) / delta.length_sq()).clamp(0.0, 1.0);
-            let d = pos.distance(s.from + delta * f);
-            (d < PEN_PATH_R).then_some((s, f, d))
-        })
-        .min_by(|a, b| a.2.total_cmp(&b.2))
-        .map(|(s, f, _)| (s, f))
-    else {
+    let Some((seg, f)) = segment_near(segments, pos) else {
         return PenTarget::None;
     };
     let is_key = |t: Tick| hits.iter().any(|h| h.tangent.is_none() && h.layer == seg.layer && h.prop == seg.prop && h.time == t);
@@ -460,7 +466,7 @@ pub(crate) fn motion_path(
         // Holds jump rather than travelling through the connecting line.
         let held = pos.keys.iter().rev().find(|k| k.time <= start).is_some_and(|k| k.out_interp == effectcraft_engine::keyframe::Interp::Hold);
         if !held {
-            segments.push(MotionSegment { layer: l.id, prop: pos.uid, from, to, start, end });
+            segments.push(MotionSegment { layer: l.id, prop: pos.uid, from, to, start, end, p2c });
         }
     }
     let faint = col.gamma_multiply(0.8);
@@ -622,6 +628,9 @@ pub(crate) enum Drag {
     Key { layer: LayerId, prop: u64, time: Tick, start: [f64; 3], press: [f64; 2], inv: Mat3 },
     /// A spatial tangent handle of a motion-path key.
     KeyTangent { layer: LayerId, prop: u64, time: Tick, out: bool, key: [f64; 3], inv: Mat3 },
+    /// The motion path between two keys, bent through the pointer (`time` inside the segment,
+    /// `u` its Bezier parameter under the press, `last` the parent-space pointer).
+    Segment { layer: LayerId, prop: u64, time: Tick, u: f64, last: [f64; 2], inv: Mat3 },
     /// Free transform: 0 move, 1 scale (anchor, axes), 2 rotate about `anchor`.
     Ft { layer: LayerId, path: u64, mode: u8, anchor: [f64; 2], last: [f64; 2], inv: Mat3, axes: [bool; 2] },
     /// Mask Feather tool: drag a feather point's radius handle (comp → layer matrix `inv`).
@@ -651,6 +660,21 @@ pub(crate) fn begin_key_drag(app: &mut EffectcraftApp, hits: &[KeyHit], press: P
             Some(Drag::Key { layer: h.layer, prop: h.prop, time: h.time, start: h.value, press: cpt, inv })
         }
     }
+}
+
+/// Start bending the motion path between two keys at `press` (comp point `cpt`): the point of
+/// the path under the press follows the pointer and only the two keys' facing spatial tangents
+/// change; no key is added (a Pen click there adds one, as Add Vertex does in After Effects).
+pub(crate) fn begin_segment_bend(app: &EffectcraftApp, segments: &[MotionSegment], press: Pos2, cpt: [f64; 2]) -> Option<Drag> {
+    let (seg, _) = segment_near(segments, press)?;
+    let inv = seg.p2c.inverse()?;
+    let keys = &app.session.active_comp()?.layer(seg.layer)?.props.find(seg.prop)?.keys;
+    let i = keys.partition_point(|k| k.time <= seg.start).checked_sub(1)?;
+    let p = inv.apply(gv2(cpt[0], cpt[1]));
+    let u = effectcraft_engine::keyframe::spatial_segment_param(keys, i, [p.x, p.y])?;
+    // A time strictly inside the sample interval names the segment exactly.
+    let time = Tick(seg.start.0 / 2 + seg.end.0 / 2);
+    Some(Drag::Segment { layer: seg.layer, prop: seg.prop, time, u, last: [p.x, p.y], inv })
 }
 
 /// Start a free-transform drag on the box: a handle scales about the opposite one (corners both
@@ -735,6 +759,18 @@ pub(crate) fn update(
             q[if out { "out" } else { "in" }] = tg;
             let _ = app.session.execute("keys.setSpatialTangents", q);
             None
+        }
+        Drag::Segment { layer, prop, time, u, last, inv } => {
+            let p = inv.apply(gv2(cpt[0], cpt[1]));
+            let cur = [p.x, p.y];
+            if cur != last {
+                let q = json!({"layer": layer.0, "prop": prop, "time": time.seconds(), "u": u, "offset": [cur[0] - last[0], cur[1] - last[1]], "merge": merge});
+                if let Err(e) = app.session.execute("keys.bendSpatialSegment", q) {
+                    app.ui.status = e.to_string();
+                    return None;
+                }
+            }
+            Some(Drag::Segment { layer, prop, time, u, last: cur, inv })
         }
         Drag::Ft { layer, path, mode, anchor, last, inv, axes } => {
             let p = inv.apply(gv2(cpt[0], cpt[1]));
@@ -837,6 +873,7 @@ mod tests {
                 to: egui::pos2(f as f32 * 20.0 + 20.0, 100.0),
                 start: t(f),
                 end: t(f + 1),
+                p2c: Mat3::IDENTITY,
             })
             .collect();
         let at = |x: f32, y: f32| pen_target(&hits, &segments, &frames, egui::pos2(x, y));
