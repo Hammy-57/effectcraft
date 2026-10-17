@@ -47,7 +47,7 @@ const MARGIN_SECS: f64 = 0.35;
 const LOW_LEAD_SECS: f64 = 1.0;
 const HIGH_LEAD_SECS: f64 = 2.5;
 /// Chunks of a new stream sent below full size (the warm-up).
-const WARM_CHUNKS: usize = 2;
+const WARM_CHUNKS: usize = MAX_IN_FLIGHT;
 /// Most seconds added to the render-ahead window for a slow pipeline.
 const MAX_EXTRA_AHEAD_SECS: f64 = 8.0;
 /// Least time between two resolution changes.
@@ -364,8 +364,7 @@ impl State {
     }
 
     /// The level for a new chunk with `lead` seconds in hand. The first chunks of a stream (the
-    /// warm-up, the app waits for them) go at half size: a quarter of the pixels to render and
-    /// encode. While playing, a short lead lowers the resolution one level and a long one raises
+    /// warm-up: the app waits for them, and caches are cold) go at quarter, then half size. While playing, a short lead lowers the resolution one level and a long one raises
     /// it, each at most once per [`LEVEL_HOLD`] (so a level gets a few chunks to show what it
     /// does); chunks sent below full size go again at full size when there is time. Before
     /// playback after the warm-up, and without `adaptive`: full size.
@@ -373,7 +372,7 @@ impl State {
         if !self.p.adaptive {
             return 0;
         }
-        // The very first chunk at quarter size, the next at half.
+        // The very first chunk at quarter size, the rest of the first burst at half.
         if self.issued < WARM_CHUNKS as u64 {
             return if self.issued == 0 { 2 } else { 1 };
         }

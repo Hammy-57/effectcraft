@@ -169,7 +169,7 @@ fn a_bad_start_fails_the_stream_and_nothing_else() {
 }
 
 #[test]
-fn an_adaptive_stream_warms_up_at_quarter_then_half_size_then_goes_full_size_before_playback() {
+fn an_adaptive_stream_warms_up_at_quarter_then_half_size_then_sends_full_size_before_playback() {
     let (p, comp) = project();
     let (mut s, rx) = streams();
     s.synced(Some((1, p)));
@@ -183,10 +183,10 @@ fn an_adaptive_stream_warms_up_at_quarter_then_half_size_then_goes_full_size_bef
         })
         .collect();
     sizes.sort_by_key(|c| c.0);
-    // The first chunk at quarter size, the second at half; the rest (and the warm-up chunks
-    // again, once the window is full: nothing plays yet) at full size.
+    // The first chunk at quarter size, the rest of the first burst at half; then all of them
+    // again at full size, once the window is full (nothing plays yet).
     let warm: Vec<(i64, u32)> = sizes.iter().filter(|c| c.2 < 1.0).map(|c| (c.0, c.1)).collect();
-    assert_eq!(warm, vec![(0, 14), (15, 32)], "quarter (16×9 fits as 14×8: even sizes), then half: {sizes:?}");
+    assert_eq!(warm, vec![(0, 14), (15, 32), (30, 32), (45, 32), (60, 32), (75, 32)], "quarter (16×9 fits as 14×8: even sizes), then half: {sizes:?}");
     let full: std::collections::BTreeSet<i64> = sizes.iter().filter(|c| c.2 == 1.0).map(|c| c.0).collect();
     assert_eq!(full.into_iter().collect::<Vec<_>>(), vec![0, 15, 30, 45, 60, 75], "{sizes:?}");
 }
