@@ -45,6 +45,8 @@ pub struct Frame {
     pub time: f64,
     pub width: u32,
     pub height: u32,
+    /// Where it rendered with a render box (`render-box` / `app`, [`crate::render_route`]).
+    pub rendered_on: Option<String>,
 }
 
 impl Backend {
@@ -62,6 +64,18 @@ impl Backend {
             results: Default::default(),
             port: addr.rsplit(':').next().and_then(|p| p.parse().ok()),
         })
+    }
+
+    /// Send renders and lint to a render box at `addr` (`serve --follow`, see
+    /// [`crate::render_route`]); everything else still goes to the bridged app. A headless
+    /// backend has no app to mirror: refused.
+    pub fn with_render_box(mut self, addr: &str) -> Result<Self> {
+        let box_client = BridgeClient::new(addr)?;
+        self.kind = match self.kind {
+            Kind::Bridge(app) => Kind::Bridge(Box::new(crate::render_route::RenderRoute::new(app, Box::new(box_client)))),
+            Kind::Headless(_) => return Err(Error::BadArgs("--render-box needs --bridge: the box mirrors a running app".into())),
+        };
+        Ok(self)
     }
 
     /// Drive an app through any control transport (e.g. an offscreen UI in this process).
@@ -272,7 +286,7 @@ impl Backend {
                 let t = time.map(Tick::from_seconds_f64).unwrap_or_else(|| s.time());
                 let (w, h, rgba) = s.render_rgba8_alpha(cid, t, max_side, transparent)?;
                 let png = encode_png(w, h, rgba, max_side)?;
-                Ok(Frame { png, comp: json!(cid.0), time: t.seconds(), width: w, height: h })
+                Ok(Frame { png, comp: json!(cid.0), time: t.seconds(), width: w, height: h, rendered_on: None })
             }
             Kind::Bridge(b) => {
                 let mut p = json!({"max_side": max_side, "base64": true});
@@ -289,7 +303,8 @@ impl Backend {
                 let data = r.get("png").and_then(Value::as_str).ok_or_else(|| Error::App("render.frame returned no `png`".into()))?;
                 let raw = base64::decode(data).ok_or_else(|| Error::App("render.frame: bad base64".into()))?;
                 let (png, width, height) = recompress_png(&raw, max_side)?;
-                Ok(Frame { png, comp: r["comp"].clone(), time: r["time"].as_f64().unwrap_or(0.0), width, height })
+                let rendered_on = r.get("renderedOn").and_then(Value::as_str).map(str::to_string);
+                Ok(Frame { png, comp: r["comp"].clone(), time: r["time"].as_f64().unwrap_or(0.0), width, height, rendered_on })
             }
         }
     }
