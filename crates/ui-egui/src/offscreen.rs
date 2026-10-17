@@ -194,8 +194,12 @@ fn build(opts: OffscreenOptions, session: Session, renderer: WgpuTestRenderer) -
         .with_step_dt(0.0)
         .with_pixels_per_point(ppp)
         .renderer(renderer)
-        .build_eframe(move |_cc| {
+        .build_eframe(move |cc| {
             let mut app = EffectcraftApp::new(session).with_control(rx);
+            // CR1: a compositor that fails (out of video memory) is retired and set up again on
+            // a new device, as in the desktop app. Its own health check reports it; the
+            // harness's device has no handlers to forward.
+            app.set_gpu_failure_bridge(crate::gpu_failure::GpuFailureBridge::new(&cc.egui_ctx));
             // RT10e: `EFFECTCRAFT_ZERO_COPY=1` draws GPU frames from their textures here too
             // (no window surface, so no traffic light).
             if crate::zero_copy::env_choice() == Some(true) {

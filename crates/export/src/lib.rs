@@ -335,11 +335,12 @@ pub(crate) fn batch_size(cx: &Cx, comp: &Comp) -> u64 {
     frames_in_flight(w, h, cx.options.memory_budget.unwrap_or(DEFAULT_MEMORY_BUDGET))
 }
 
-/// Frames rendering at once: one per core (2–16), fewer when that many `w × h` frames would
-/// take more than `budget` bytes in flight (a 4K frame and the canvases and layer buffers
-/// rendering it take about four `f32` frames, ~530 MB).
+/// Frames rendering at once: one per core (2–16, capped by `EFFECTCRAFT_FRAME_THREADS` or
+/// `--frame-threads`, see [`effectcraft_render::concurrency`]), fewer when that many `w × h`
+/// frames would take more than `budget` bytes in flight (a 4K frame and the canvases and layer
+/// buffers rendering it take about four `f32` frames, ~530 MB).
 pub(crate) fn frames_in_flight(w: u32, h: u32, budget: usize) -> u64 {
-    let threads = rayon::current_num_threads().clamp(2, 16) as u64;
+    let threads = effectcraft_render::concurrency::frame_threads(rayon::current_num_threads()) as u64;
     let frame = (w as u64).saturating_mul(h as u64).saturating_mul(16 * 4).max(1);
     (budget as u64 / frame).clamp(1, threads)
 }
