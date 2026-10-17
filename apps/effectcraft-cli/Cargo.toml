@@ -32,6 +32,9 @@ effectcraft-time = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true }
 cpu-time = "1"
+# `drive-pull`: Google Drive share links over HTTPS, pure-Rust TLS as motionlib's downloads.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+rustls-rustcrypto = "0.0.2-alpha"
 
 [dev-dependencies]
 effectcraft-media = { workspace = true }
