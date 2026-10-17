@@ -445,6 +445,8 @@ pub struct EffectcraftApp {
     last_edit: (f64, u64),
     /// Edit → viewer frame latency, for `ui.inspect`'s `latency`.
     pub(crate) latency: EditLatency,
+    /// Where the playing comp's sections start (playback prefetch).
+    sections: playback_sections::Sections,
     pub(crate) toast: Option<(String, f64)>,
     /// Texture of the last CPU frame shown in the viewer, the key it came from and the factor it
     /// was averaged down by for the magnification (`panels::viewer::minify_factor`).
@@ -579,6 +581,7 @@ impl EffectcraftApp {
             last_activity: (0.0, 0),
             last_edit: (0.0, 0),
             latency: Default::default(),
+            sections: Default::default(),
             toast: None,
             viewer_tex: None,
             passive_tex: std::collections::HashMap::new(),
@@ -1808,6 +1811,16 @@ impl EffectcraftApp {
             if !self.frames.is_cached(&FrameKey { frame: f, ..series }) {
                 self.request_frame(cid, f, scale);
                 queued += 1;
+            }
+        }
+        // The frames where the next sections start, a few seconds early (`playback_sections`).
+        if let Some(p) = plan.filter(|p| p.video) {
+            let lead = (playback_sections::LEAD * fr.as_f64()).round() as i64;
+            let from = cur.saturating_add(window.saturating_sub(1).saturating_mul(step));
+            for f in self.sections.ahead(&self.session.project, self.session.revision, cid, cur, from, lead, step, p.end) {
+                if !self.frames.is_cached(&FrameKey { frame: f, ..series }) {
+                    self.request_frame(cid, f, scale);
+                }
             }
         }
         if let Some(a) = &mut self.audio {
