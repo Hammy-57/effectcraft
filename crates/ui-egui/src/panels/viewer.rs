@@ -1589,6 +1589,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
             }
+            // Pen or Convert Vertex drag on the motion path between two keys: bend it through the
+            // pointer by those keys' spatial tangents, adding no key (a click adds one).
+            Tool::Pen | Tool::PenConvert
+                if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::AddFrame(_) | ov::PenTarget::PathFull) =>
+            {
+                ov::begin_segment_bend(app, &motion_segments, press, map.to_comp(press)).map(Gesture::Overlay)
+            }
             Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
             }

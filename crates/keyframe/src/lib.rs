@@ -10,7 +10,9 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod spatial_bend;
 mod spatial_insert;
+pub use spatial_bend::{bend_spatial_segment, spatial_segment_param};
 pub use spatial_insert::insert_spatial;
 
 pub mod text_doc;
