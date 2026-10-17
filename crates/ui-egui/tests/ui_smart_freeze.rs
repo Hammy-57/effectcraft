@@ -97,6 +97,9 @@ fn a_heavy_layer_gets_a_timeline_hint_whose_button_freezes_it_and_whose_cross_di
     assert_eq!(sections.len(), 1, "status={}", h.state().ui.status);
     assert!(sections[0].auto, "a frozen hint stays fresh");
     let root = effectcraft_engine::freeze_storage::root(&h.state().session.project.freeze.namespace).unwrap();
+    h.run_steps(3);
+    let result = h.state().auto.elements.iter().chain(h.state().auto.previous.iter()).find(|e| e.id == "timeline.freezeHint.result");
+    assert_eq!(result.map(|e| e.label.as_str()), Some("Frozen ✓ Stat Stack"), "the click ends in a visible result");
     assert!(!h.state().auto.elements.iter().any(|e| e.id == "timeline.freezeHint"), "frozen layers are not suggested again");
     drop(h);
     std::fs::remove_dir_all(root).ok();
