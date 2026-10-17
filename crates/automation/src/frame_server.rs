@@ -31,7 +31,7 @@ use effectcraft_engine::project::{ItemId, Project};
 use effectcraft_engine::remote::{FrameMsg, FrameReply, FrameServer};
 use effectcraft_engine::remote_encode::{self, Codec, Want};
 use effectcraft_engine::remote_wire::{Down, MAX_HELLO, MAX_PART, Up, VERSION, read_frame, write_frame};
-use effectcraft_engine::render::{Backend, ExprHost, FootageSource, Image, LayerCache, NoFootage, RenderOpts, Renderer};
+use effectcraft_engine::render::{Backend, ExprHost, FootageSource, Image, LayerCache, LayerTimes, NoFootage, RenderOpts, Renderer};
 use effectcraft_engine::time::Tick;
 use serde_json::{Value, json};
 
@@ -58,6 +58,8 @@ pub struct RenderJob<'a> {
     pub opts: RenderOpts,
     /// The server's layer cache (shared by every worker and connection).
     pub cache: &'a LayerCache,
+    /// Where each layer's render time goes (the Mac's Render Time pane), when timed.
+    pub times: Option<&'a LayerTimes>,
 }
 
 /// A rendered frame.
@@ -89,6 +91,7 @@ impl FrameRender for CpuRender {
         let mut r = Renderer::new(job.project, self.footage.as_ref(), RenderOpts { backend: Backend::Cpu, ..job.opts });
         r.expr = self.expr.as_deref();
         r.cache = Some(job.cache);
+        r.times = job.times;
         Ok((Rendered::Image(r.comp_frame_cpu(job.comp, job.time)), false))
     }
 }
@@ -423,7 +426,8 @@ fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<
     }
     let wait = queued.elapsed();
     let t0 = Instant::now();
-    let rendered = shared.render.render(&RenderJob { project: &project, comp, time, opts, cache: &shared.cache });
+    let times = LayerTimes::default();
+    let rendered = shared.render.render(&RenderJob { project: &project, comp, time, opts, cache: &shared.cache, times: Some(&times) });
     let (frame, gpu) = match rendered {
         Ok(r) => r,
         Err(e) => {
@@ -459,7 +463,8 @@ fn render_job(job: Job, depth: usize, sched: &Sched, shared: &Shared) -> Option<
         payload.len() / 1024,
         ms(wait),
     ));
-    let reply = FrameReply::Frame { id, width: w, height: h, ms: render_ms, passes: 1, gpu, layer_misses: vec![], layer_hits: vec![] };
+    let layer_times = times.into_map().into_iter().map(|((c, l), ms)| (c, l, ms as f32)).collect();
+    let reply = FrameReply::Frame { id, width: w, height: h, ms: render_ms, passes: 1, gpu, layer_misses: vec![], layer_hits: vec![], layer_times };
     if want.refine && want.codec == Codec::Jpeg {
         sched.refine(Refine { conn, id, revision, reply: reply.clone(), width: w, height: h, rgba, out: out.clone(), current });
     }

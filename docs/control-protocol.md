@@ -396,3 +396,35 @@ next to the JSON lines, so each message is one length-prefixed frame
 `effectcraft_engine::remote_wire::FrameClient` is the client: it reconnects with backoff (0.1 s
 doubling to 5 s) and reports each connection, after which the app sends its project again. A lost
 connection is an event, never an error for the document.
+
+## Render box
+
+`effectcraft-cli serve --gpu --follow APP_PORT --control PORT` is a render box: a windowless
+EffectCraft on the same machine as the desktop app that mirrors the app's project, so agents
+render and lint there instead of on the GPU and UI thread the user plays back on. The app stays
+the one source of truth: the box is read-only (a command that changes its project is undone and
+answers an error), keeps no checkpoints, is not in the host list, and `host.release` just stops it.
+
+- **`app.sync {follower, have?}`** (the app, and any `serve` host): what the follower needs to hold
+  the session's revision. `have` is the app revision it holds; when it matches what was last sent
+  to `follower`, the reply is a CR3 patch of the comps and layers that changed (a pointer diff,
+  cheap on the UI thread), else the whole project. Reply `{revision, kind: same|patch|project,
+  msg?, bytes?, cursors, path}`: `msg` is base64 of `remote_sync::encode_msg` (a whole project
+  zstd-compressed); `cursors` is `{user: {comp, time}, agents: {name: {comp, time}}}` (time in
+  ticks), so a render without `comp` or `time` shows what it would in the app. The app makes the
+  bytes on another thread. At most four followers per session.
+- The box pulls before every `engine.execute` / `render.frame` (a render shows the edit made just
+  before it), every 200 ms while the project keeps changing and every 500 ms when it is calm.
+  An app without `app.sync` (older builds) is followed by `file.saveCopy` when its revision
+  changed, only before requests. A render the box can't bring up to date fails with
+  `render box out of sync with the app: …`.
+- At most two renders run at once on the box; later ones queue. `host.info` adds `follow:
+  {app, mode: sync|copy, appRevision, connected, pulls, patches, projects, errors, bytes, lastMs,
+  lastError}` and `queued`.
+- `EFFECTCRAFT_GPU_VRAM_CAP_MB` caps the box's video memory: creating a texture or buffer past
+  that share of the driver's budget fails, and the frame renders on the CPU instead of taking
+  memory from the app (on Vulkan / Direct3D 12 the cap shrinks while other programs use the card).
+- **MCP:** `effectcraft-cli mcp --bridge APP --render-box BOX` sends `render.frame`,
+  `render.contactSheet`, `render.lint`, `render.snapshot` and `render.compare` to the box and
+  everything else to the app. Replies carry `renderedOn: render-box | app`. While the box is
+  unreachable or out of sync, renders run in the app (retried on the box after 10 s).

@@ -91,7 +91,7 @@ mod tests {
     fn render(guard: &Arc<dyn FrameRender>, s: &effectcraft_engine::Session) -> Result<(Rendered, bool), String> {
         let cache = LayerCache::new(1 << 20);
         let comp = s.active_comp_id().ok_or("no comp")?;
-        guard.render(&RenderJob { project: &s.project, comp, time: Tick::ZERO, opts: RenderOpts::default(), cache: &cache })
+        guard.render(&RenderJob { project: &s.project, comp, time: Tick::ZERO, opts: RenderOpts::default(), cache: &cache, times: None })
     }
 
     #[test]

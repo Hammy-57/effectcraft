@@ -185,6 +185,8 @@ pub(crate) fn publish(e: &mut Enc) {
     for (k, (source, levels)) in built {
         for (n, img) in levels {
             let Some(allocation) = img.allocation.clone().filter(|a| a.generation().same(&g.generation)) else { continue };
+            img.share();
+            g.leased.publish("mips", &img);
             let Ok(slot) = owner.prepare(Arc::new(img), allocation, GpuStage::Blend, cap).and_then(|p| p.publish()) else { continue };
             let level = Level { owner: owner.clone(), slot };
             let rejected = match g.mips.chains.lock() {
