@@ -194,6 +194,14 @@ impl FrameRender for GpuRender {
     fn gpu_name(&self) -> Option<String> {
         Some(self.current().name())
     }
+
+    fn warm(&self, project: &effectcraft_engine::project::Project, comp: effectcraft_engine::project::ItemId, time: Tick) {
+        let gpu = self.current();
+        if gpu.context().check_health().is_ok() {
+            let r = gpu.warm_project(project, comp, time);
+            (self.log)(&format!("GPU warm-up: {} pipelines created, {} sequences ready", r.created, r.ready_sequences));
+        }
+    }
 }
 
 /// Frames on the GPU at once: `EFFECTCRAFT_FRAME_GPU_SLOTS`, else 1 (at most the workers). A

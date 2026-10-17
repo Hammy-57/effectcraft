@@ -42,6 +42,11 @@ const MAX_IN_FLIGHT: usize = 3;
 const LEVELS: [f32; 3] = [1.0, 0.5, 0.25];
 /// Lead kept on top of a level's chunk latency before choosing it (network, decode).
 const MARGIN_SECS: f64 = 0.35;
+/// Below this lead (seconds) a playing stream lowers its resolution; above the high one it raises it.
+const LOW_LEAD_SECS: f64 = 0.8;
+const HIGH_LEAD_SECS: f64 = 2.5;
+/// Least time between two resolution changes.
+const LEVEL_HOLD: Duration = Duration::from_millis(1200);
 /// How often the controller looks again without being woken.
 const TICK: Duration = Duration::from_millis(40);
 /// Encoder threads for a chunk the app waits for, and for one sent ahead.
@@ -293,6 +298,9 @@ struct State {
     seq: u64,
     /// Seconds from a chunk's start to sent, per level (running average).
     latency: [Option<f64>; 3],
+    /// The resolution level new chunks get, and when it last changed.
+    cur_level: usize,
+    level_at: Instant,
     ended: Option<(u64, u64)>,
 }
 
@@ -325,22 +333,24 @@ impl State {
         have as f64 / self.p.fps()
     }
 
-    /// The level for a new chunk with `lead` seconds in hand.
-    fn level(&self, lead: f64) -> usize {
-        if !self.p.adaptive {
+    /// The level for a new chunk with `lead` seconds in hand. While playing, a short lead lowers
+    /// the resolution one level and a long one raises it, each at most once per
+    /// [`LEVEL_HOLD`] (so a level gets a few chunks to show what it does). Before playback (the
+    /// pre-roll) and without `adaptive`: full size.
+    fn level(&mut self, lead: f64) -> usize {
+        if !self.p.adaptive || !self.playing {
             return 0;
         }
-        for (l, est) in self.latency.iter().enumerate() {
-            match est {
-                // Not measured yet: full size once there is a chunk in hand, else try it below.
-                None if l == 0 && lead > 1.0 => return 0,
-                None if l == 0 => continue,
-                None => return l,
-                Some(s) if s + MARGIN_SECS <= lead => return l,
-                Some(_) => {}
-            }
+        let held = self.level_at.elapsed() >= LEVEL_HOLD;
+        let short = LOW_LEAD_SECS.max(self.latency[self.cur_level.min(2)].unwrap_or(0.0) + MARGIN_SECS);
+        if lead < short && self.cur_level + 1 < LEVELS.len() && held {
+            self.cur_level += 1;
+            self.level_at = Instant::now();
+        } else if lead > HIGH_LEAD_SECS && self.cur_level > 0 && held {
+            self.cur_level -= 1;
+            self.level_at = Instant::now();
         }
-        LEVELS.len() - 1
+        self.cur_level
     }
 }
 
@@ -376,6 +386,8 @@ impl Shared {
             edits: vec![],
             seq: 0,
             latency: [None; 3],
+            cur_level: 0,
+            level_at: Instant::now(),
             ended: None,
         };
         Shared { host, out, conn, id, state: Mutex::new(state), cv: Condvar::new(), work: Condvar::new() }
@@ -472,6 +484,13 @@ impl Shared {
 
     /// The controller: start the next chunk while fewer than [`MAX_IN_FLIGHT`] are in flight.
     fn control(self: Arc<Self>) {
+        let (project, comp, time) = {
+            let st = lock(&self.state);
+            (st.project.clone(), st.p.comp, st.p.rate.tick_of(st.playhead))
+        };
+        let t0 = Instant::now();
+        self.host.render.warm(&project, comp, time);
+        self.log(&format!("warmed up in {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0));
         let mut st = lock(&self.state);
         loop {
             if st.stop {

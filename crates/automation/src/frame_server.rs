@@ -77,6 +77,8 @@ pub trait FrameRender: Send + Sync {
     fn gpu_name(&self) -> Option<String> {
         None
     }
+    /// Get ready to render `comp` around `time` (compile what its frames need), before a stream.
+    fn warm(&self, _project: &Project, _comp: ItemId, _time: Tick) {}
 }
 
 /// Frames on the CPU.
