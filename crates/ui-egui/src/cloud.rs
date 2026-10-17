@@ -394,6 +394,7 @@ impl Link {
             Down::Echo { id } => {
                 if self.syncing.is_some_and(|(s, _)| s == id) {
                     self.syncing = None;
+                    self.ping = None;
                     self.update_slots();
                 } else if let Some((p, sent)) = self.ping
                     && p == id
@@ -484,14 +485,18 @@ impl Link {
             self.resync();
         }
         // A silent link (a sleeping laptop, a stalled tunnel) never reports an error: an echo
-        // or a whole project that doesn't come back means it is dead.
-        let dead = self.ping.is_some_and(|(_, at)| at.elapsed() > DEAD) || self.syncing.is_some_and(|(_, at)| at.elapsed() > PROJECT_DEAD);
+        // or a whole project that doesn't come back means it is dead. While a whole project is
+        // on its way, echoes queue behind it: only its own deadline counts then.
+        let dead = match self.syncing {
+            Some((_, at)) => at.elapsed() > PROJECT_DEAD,
+            None => self.ping.is_some_and(|(_, at)| at.elapsed() > DEAD),
+        };
         if dead {
             self.client.drop_connection();
             self.lost("the cloud stopped answering".into());
             return;
         }
-        if self.ping.is_none() && self.last_ping.is_none_or(|t| t.elapsed() >= PING) {
+        if self.syncing.is_none() && self.ping.is_none() && self.last_ping.is_none_or(|t| t.elapsed() >= PING) {
             let id = self.id();
             if self.client.send(Up::Echo { id }, vec![]) {
                 let now = Instant::now();
