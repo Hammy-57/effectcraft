@@ -333,9 +333,13 @@ impl<'a> Cx<'a> {
     /// GPU frames rendered at once (#879), decided once per batch: with a GPU accelerator every
     /// frame in flight holds its own working textures, so a whole batch rendered at once can
     /// exhaust VRAM (or shared memory, which crashes instead of falling back). `None` when the
-    /// frames render on the CPU: no accelerator, or a Software Only project.
+    /// frames render on the CPU: no accelerator, or a Software Only project. After the GPU ran
+    /// out of memory, at most half as many as were in flight then (CR1,
+    /// [`effectcraft_render::Accelerator::max_inflight`]).
     fn gpu_cap(&self) -> Option<usize> {
-        (self.job.accel.is_some() && self.project.settings.gpu_acceleration).then(|| gpu_inflight(std::env::var(GPU_INFLIGHT_ENV).ok().as_deref()))
+        let accel = self.job.accel.filter(|_| self.project.settings.gpu_acceleration)?;
+        let n = gpu_inflight(std::env::var(GPU_INFLIGHT_ENV).ok().as_deref());
+        Some(accel.max_inflight().map_or(n, |most| n.min(most.max(1))))
     }
 
     /// Output frames `0..total` in batches of `batch` frames, each frame mapped by `f`

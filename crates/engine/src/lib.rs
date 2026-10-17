@@ -1043,6 +1043,21 @@ impl Session {
     /// `comp` moves the current time of the comps nested in it (through their precomp layers'
     /// timing) and of the comps it is nested in, so every related viewer shows the same moment.
     pub fn sync_related_times(&mut self, comp: ItemId, t: Tick) {
+        // Who nests whom, from one pass over the layers: each nested comp's parents in project
+        // order, with the first precomp layer of it in each. Searching the whole project for the
+        // parents of every related comp took ~20 ms per call on a project with 380 comps, and
+        // playback calls this on every frame (the UI thread then drew 25 frames a second).
+        let mut parents: std::collections::BTreeMap<ItemId, Vec<(ItemId, usize)>> = std::collections::BTreeMap::new();
+        for (pid, pc) in self.project.comps() {
+            for (i, l) in pc.layers.iter().enumerate() {
+                if let effectcraft_project::LayerSource::Comp { item } = &l.source {
+                    let of = parents.entry(*item).or_default();
+                    if of.last().is_none_or(|(p, _)| p != pid) {
+                        of.push((*pid, i));
+                    }
+                }
+            }
+        }
         let mut seen = std::collections::BTreeSet::from([comp]);
         let mut todo = vec![(comp, t)];
         let mut found = vec![];
@@ -1060,12 +1075,11 @@ impl Session {
                 }
             }
             // Up: the comps nesting this one.
-            for iid in self.project.items.keys() {
-                if let Some(pc) = self.project.comp(*iid)
-                    && let Some(l) = pc.layers.iter().find(|l| matches!(&l.source, effectcraft_project::LayerSource::Comp { item } if *item == cid))
-                    && seen.insert(*iid)
+            for &(pid, i) in parents.get(&cid).into_iter().flatten() {
+                if let Some(l) = self.project.comp(pid).and_then(|pc| pc.layers.get(i))
+                    && seen.insert(pid)
                 {
-                    todo.push((*iid, l.comp_time(ct)));
+                    todo.push((pid, l.comp_time(ct)));
                 }
             }
         }

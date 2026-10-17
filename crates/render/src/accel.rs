@@ -95,6 +95,11 @@ pub trait Accelerator: Send + Sync {
     fn available(&self) -> bool {
         true
     }
+    /// At most how many frames should render on the accelerator at once, after it ran out of
+    /// memory (CR1). `None`: no limit of its own.
+    fn max_inflight(&self) -> Option<usize> {
+        None
+    }
     /// Deferred readbacks: where a GPU readback cannot be waited for (WebGPU in a browser
     /// worker), a frame renders in *passes*. A readback the accelerator does not have yet is
     /// started, the step returns a cheap placeholder and the pass is marked missed
