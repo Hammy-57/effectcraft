@@ -1213,6 +1213,24 @@ impl Frames {
         self.cache.lock().map(|c| c.map.contains_key(k)).unwrap_or(false)
     }
 
+    /// A frame from the cloud's playback stream (CR6b, [`crate::cloud_stream`]): cached under
+    /// `k` as it is (a half- or quarter-size frame shows scaled up).
+    pub fn insert_streamed(&self, k: FrameKey, img: Arc<egui::ColorImage>) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert(k, FrameImage::Cpu(img));
+        }
+    }
+
+    /// Take one frame out of the RAM cache (a stream's low-resolution or stale frame).
+    pub fn remove_frame(&self, k: &FrameKey) {
+        if let Ok(mut c) = self.cache.lock()
+            && c.map.contains_key(k)
+        {
+            c.order.remove(k);
+            c.remove(k);
+        }
+    }
+
     pub fn inflight(&self) -> usize {
         self.inflight.lock().map(|s| s.len()).unwrap_or(0)
     }

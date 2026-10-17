@@ -673,6 +673,12 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     let (rtt_ms, cloud_queue) = (cloud.as_ref().and_then(|c| c.rtt_ms), cloud.as_ref().map_or(0, |c| c.queue));
     #[cfg(target_arch = "wasm32")]
     let (rtt_ms, cloud_queue): (Option<f64>, usize) = (None, 0);
+    // CR6b: the cloud playback stream (warm-up, late chunks, stalls, kbit/s), the running one's or
+    // the last one's.
+    #[cfg(not(target_arch = "wasm32"))]
+    let stream = app.cloud_play.stats();
+    #[cfg(target_arch = "wasm32")]
+    let stream: Option<()> = None;
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
@@ -702,6 +708,7 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
             "lastShownTimeSeconds": last_shown,
             "lastShownAgeSeconds": last_shown.map(|t| (now - t).max(0.0)),
             "intervals": shown_intervals(&app.playback.log),
+            "stream": stream,
         },
         // Edit → viewer frame: `shownAt - editAt` once `shownRevision >= editRevision`.
         "latency": {
