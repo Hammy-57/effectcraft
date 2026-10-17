@@ -254,8 +254,10 @@ pub(crate) fn frame_cache(log: &frame_server::LogFn) -> Arc<FrameCache> {
 }
 
 /// The frame cache's RAM without a setting: Elias's rule for every RAM cache together (85 % of
-/// what this container may use: the cgroup limit, else the machine's RAM), less 8 GiB for the
-/// process and the layer cache; 4096 MiB where that can't be read (not Linux).
+/// what this machine may use: the smaller of the rental's allotment `EFFECTCRAFT_RAM_GB` (decimal
+/// GB), the cgroup limit and the machine's RAM), less 8 GiB for the process and the layer cache;
+/// 4096 MiB where none can be read. Without ec-tune it doesn't know the desktop app's caches:
+/// cloud.sh passes ec-tune's share instead.
 fn default_frames_mb() -> u64 {
     let read = |p: &str| std::fs::read_to_string(p).ok();
     let limit = ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
@@ -265,7 +267,8 @@ fn default_frames_mb() -> u64 {
     let total = read("/proc/meminfo")
         .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
         .map(|kb| kb.saturating_mul(1024));
-    let Some(ram) = limit.into_iter().chain(total).min() else { return 4096 };
+    let allot = std::env::var("EFFECTCRAFT_RAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|g| g.is_finite() && *g > 0.0).map(|g| (g * 1e9) as u64);
+    let Some(ram) = limit.into_iter().chain(total).chain(allot).min() else { return 4096 };
     let mb = (ram / 100).saturating_mul(85) >> 20;
     mb.saturating_sub(8192).saturating_sub(cache_budget() as u64 >> 20).max(1024)
 }

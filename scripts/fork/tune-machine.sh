@@ -74,6 +74,22 @@ def cgroup_limit(host):
 host = host_ram()
 limit = cgroup_limit(host)
 ram = limit if limit else host
+# The RAM the rental actually allots (vast's portal: 256.8 GB on the 3090, while its cgroup says 342 GiB): EFFECTCRAFT_RAM_GB, else
+# the number in <conf>/machine-ram-gb. Decimal GB. Every cache is sized from the smaller of this and the cgroup/host value.
+def allotment():
+    v = os.environ.get("EFFECTCRAFT_RAM_GB", "").strip()
+    if not v:
+        try:
+            v = open(os.path.join(a.conf, "machine-ram-gb")).read().strip()
+        except OSError:
+            v = ""
+    try:
+        return int(float(v) * 1e9) if float(v) > 0 else None
+    except ValueError:
+        return None
+allot = allotment()
+if allot and allot < ram:
+    ram = allot
 cores = os.cpu_count() or 1
 g = sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits").splitlines()
 gpu_name, vram = (g[0].split(",")[0].strip(), int(g[0].split(",")[1]) * (1 << 20)) if g and "," in g[0] else ("none", 0)
@@ -140,7 +156,7 @@ reserve_gb = max(math.ceil(ram * (1 - CACHE_SHARE) / GIB), RESERVE_MIN_GB)
 cache_total = max(ram - reserve_gb * GIB, 3 * GIB)
 # The app caps its caches at MemTotal - reserve and reads the host's MemTotal (not the cgroup), so in a container
 # the reserve also covers the RAM the container can't have: the app's own cap then stays inside the limit too.
-if limit:
+if ram < host:
     reserve_gb = max(math.ceil((host - cache_total) / GIB), reserve_gb)
 layer = rule(LAYER_RULE)
 media = rule(MEDIA_RULE)
@@ -205,7 +221,7 @@ if not a.force:
             new[k] = get(prefs, k); kept.add(k)
 changes = [(k, get(prefs, k), v) for k, v in new.items() if get(prefs, k) != v]
 gb = lambda b: f"{b / GIB:.0f} GB"
-head = (f"this machine: {gb(ram)} RAM{f' (container limit; host has {gb(host)})' if limit else ''}, {cores} CPUs, {gpu_name} {gb(vram)} VRAM, disk {gb(disk_size)} "
+head = (f"this machine: {gb(ram)} RAM{' (allotted: EFFECTCRAFT_RAM_GB / machine-ram-gb)' if allot and ram == allot else ''}{f' (container limit; host has {gb(host)})' if limit and ram == limit else ''}, {cores} CPUs, {gpu_name} {gb(vram)} VRAM, disk {gb(disk_size)} "
         f"({gb(disk_usable)} usable for the cache at {cache_dir})")
 if a.quiet:
     print(f"tune-machine: {len(changes)} machine settings {'would change' if a.dry_run else 'set'}; caches "
@@ -244,9 +260,11 @@ if changes:
     except Exception:
         pass
 mt = os.path.join(a.conf, "machine-tune.json")
-# The cloud frame server's frame cache (CR8; cloud.sh exports it): the preview share (it stands in for the app's RAM preview
-# when the Mac edits and this machine renders) and the disk cache's room, in a folder of its own.
-serve = {"framesMb": mb(preview), "framesDiskGb": disk_gb if disk_on else 0, "framesDir": os.path.join(os.path.dirname(cache_dir), "server-frames")}
+# The cloud frame server's frame cache (CR8; cloud.sh exports it): what the app's caches leave of the cache total (no double
+# count with the browser desktop app's preview cache; serve's own 1 GiB layer cache counted), at least 2 GiB, and the disk
+# cache's room in a folder of its own.
+serve_frames = max(cache_total - layer - media - preview - GIB, 2 * GIB)
+serve = {"framesMb": mb(serve_frames), "framesDiskGb": disk_gb if disk_on else 0, "framesDir": os.path.join(os.path.dirname(cache_dir), "server-frames")}
 json.dump({"at": time.strftime("%F %T"), "ram": ram, "hostRam": host, "cgroupLimit": limit, "cores": cores, "gpu": gpu_name, "vram": vram, "diskSize": disk_size,
            "diskUsable": disk_usable, "cacheDir": cache_dir, "longestComp": longest[1:], "set": new, "hand": sorted(kept), "serve": serve},
           open(mt, "w"), indent=1)

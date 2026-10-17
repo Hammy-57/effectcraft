@@ -188,7 +188,12 @@ if [ "$skip" = 0 ]; then
   cd /workspace
   [ -f "$HOME/.config/effectcraft/cloud.env" ] && . "$HOME/.config/effectcraft/cloud.env"
   export EFFECTCRAFT_FONT_DIRS EFFECTCRAFT_CJK_LOCALE
-  # CR8: the server frame cache sized by ec-tune (machine-tune.json "serve"); without it serve takes 85 % of the container less 8 GB.
+  # CR8: the RAM the rental allots (machine-ram-gb, decimal GB, the vast portal figure) caps every cache size.
+  for rg in /home/user/.config/effectcraft/machine-ram-gb "$HOME/.config/effectcraft/machine-ram-gb"; do
+    [ -f "$rg" ] && export EFFECTCRAFT_RAM_GB="$(tr -dc 0-9. <"$rg")" && break
+  done
+  # CR8: the server frame cache sized by ec-tune (machine-tune.json "serve"); without it serve takes 85 % of the RAM
+  # (the smaller of EFFECTCRAFT_RAM_GB and the container limit) less 8 GB.
   for mt in /home/user/.config/effectcraft/machine-tune.json "$HOME/.config/effectcraft/machine-tune.json"; do
     [ -f "$mt" ] || continue
     eval "$(python3 -c "import json,shlex,sys; s=json.load(open(sys.argv[1])).get(\"serve\") or {}; [print(f\"export {k}={shlex.quote(str(s[j]))}\") for k,j in ((\"EFFECTCRAFT_SERVER_FRAMES_MB\",\"framesMb\"),(\"EFFECTCRAFT_SERVER_FRAMES_DISK_GB\",\"framesDiskGb\"),(\"EFFECTCRAFT_SERVER_FRAMES_DIR\",\"framesDir\")) if j in s]" "$mt" 2>/dev/null)"

@@ -76,8 +76,12 @@ Elias's home internet is metered: only the frames he looks at should cross it.
 - Keys are the Mac's disk-cache keys (`CacheSeries::key` → `disk_cache::frame_key`): an edit changes the comp's
   content key, so old frames are never served for new content; they age out of the server's cache.
 - Size: `EFFECTCRAFT_SERVER_FRAMES_MB` (RAM) and `EFFECTCRAFT_SERVER_FRAMES_DISK_GB` / `_DIR` (spill to disk;
-  0 = off). `connect` exports them from `ec-tune`'s `machine-tune.json` (`"serve"`: the preview share and the disk
-  cache's room); without it serve takes 85 % of the container's RAM less 8 GB, and no disk.
+  0 = off). `connect` exports them from `ec-tune`'s `machine-tune.json` (`"serve"`: what the browser desktop app's
+  caches leave of 85 % of RAM, so nothing is counted twice, and the disk cache's room); without it serve takes 85 % of
+  RAM less 8 GB, and no disk.
+- **RAM = the rental's allotment.** vast's portal figure (256.8 GB on the 3090) is smaller than the container's cgroup
+  limit (342 GiB): put it in `/home/user/.config/effectcraft/machine-ram-gb` (decimal GB; or `EFFECTCRAFT_RAM_GB`).
+  ec-tune and serve size every cache from the smaller of it and the cgroup/host value.
 - **Internet use:** the Preview dropdown's tooltip, `ui.inspect` (`cloud.bytesDown`, `cloud.bytesUp`,
   `cloud.serverCache`) and `cloud.sh status` show MB down/up this session (every byte on the wire).
 
