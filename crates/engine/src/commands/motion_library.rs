@@ -51,6 +51,7 @@ pub fn card_summary(c: &Card) -> Value {
         "description": description,
         "duration": c.duration,
         "needsFootage": c.needs_footage(),
+        "onMac": c.on_mac,
         "source": "motion",
         "library": "Motion Library",
     })
@@ -151,6 +152,8 @@ pub fn search_hits(s: &Session, query: &str, category: Option<&str>, kind: Optio
     let Some(cat) = client.catalog() else { return vec![] };
     effectcraft_motionlib::search(&cat.cards, query, "")
         .into_iter()
+        // Insertable cards only (on-the-Mac cards are listed by library.catalog).
+        .filter(|c| c.applicable())
         .filter(|c| kind.is_none_or(|k| c.kind.eq_ignore_ascii_case(k)))
         .filter(|c| category.is_none_or(|q| c.category.to_lowercase().contains(q)))
         .map(card_summary)
@@ -307,6 +310,7 @@ fn publish(s: &mut Session, p: &Value) -> Result<Value> {
             map.iter().filter_map(|(f, mb)| Some((f.clone(), (mb.as_f64().filter(|m| m.is_finite() && *m >= 0.0)? * 1e6) as u64))).collect();
     }
     opts.include_video = b_p(p, "includeVideo").unwrap_or(false);
+    opts.catalog_all = b_p(p, "catalogAll").unwrap_or(false);
     opts.dry_run = b_p(p, "dryRun").unwrap_or(false);
     opts.force = b_p(p, "force").unwrap_or(false);
     let remote = match str_p(p, "remote") {
@@ -392,7 +396,7 @@ pub fn specs() -> Vec<CommandSpec> {
         query!(
             "library.publish",
             "Publish Motion Library",
-            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
+            "{library (folder with library.json), folders? (default [\"Devin Jatho\", \"SceneYard\"]), maxFileMB? (default 90: the Worker takes uploads up to 100 MB), maxPreviewMB?, folderMaxMB? ({\"SceneYard\": 5}: per-folder file limit), includeVideo? (default false), catalogAll? (also list every other entry with its thumbnail only: applied on the Mac), dryRun?, force? (upload every blob again), remote? (default the configured one)} — desktop: uploads only new files, then the manifest and a bumped version → {version, previous, unchanged, cards, needsFootage, onMac, uploads, uploadBytes, blobs, totalBytes, new, changed, removed, skipped, skippedCount, errors, log}",
             publish
         ),
     ]
