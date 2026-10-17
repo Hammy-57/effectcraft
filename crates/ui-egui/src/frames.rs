@@ -725,9 +725,7 @@ fn max_running_gated(job: &Job, threads: usize, gate: &vram::Gate) -> usize {
     let cpu = ((job.src.layer_cache.budget() as f64 / frame) as usize).max(1);
     let on_gpu = |g: &Gpu| job.on_gpu.unwrap_or_else(|| composites_on_gpu(job, g));
     match job.src.gpu.as_ref().filter(|g| on_gpu(g)) {
-        Some(g) => gate
-            .limit(g, frame, threads)
-            .unwrap_or_else(|| cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)).min(gate.ceiling())),
+        Some(g) => gate.limit(g, frame, threads).unwrap_or_else(|| cpu.max(((gpu_working_budget(g) as f64 / frame) as usize).min(threads)).min(gate.ceiling())),
         None => cpu,
     }
 }

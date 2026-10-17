@@ -1169,9 +1169,7 @@ impl GpuContext {
         self.vram?;
         let latest = *self.vram_live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(not(target_arch = "wasm32"))]
-        if latest.is_none_or(|(t, _)| t.elapsed() >= std::time::Duration::from_secs(1))
-            && !self.vram_asking.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if latest.is_none_or(|(t, _)| t.elapsed() >= std::time::Duration::from_secs(1)) && !self.vram_asking.swap(true, std::sync::atomic::Ordering::AcqRel) {
             let (live, asking, (kind, vendor, device)) = (self.vram_live.clone(), self.vram_asking.clone(), self.adapter_ids);
             let ask = move || {
                 if let Some(m) = crate::vram::query(kind, vendor, device) {
