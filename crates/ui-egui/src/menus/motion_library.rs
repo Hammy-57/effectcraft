@@ -34,8 +34,8 @@ fn view(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value
     crate::panels::motion_library::set_view(&mut app.ui.motion_library, &params)
 }
 
-fn apply(app: &mut EffectcraftApp, _ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
-    crate::panels::motion_library::start_apply(&mut app.ui.motion_library, &params)
+fn apply(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
+    crate::panels::motion_library::apply_command(app, ctx, &params)
 }
 
 fn copy_name(app: &mut EffectcraftApp, ctx: &egui::Context, _id: &str, params: Value) -> Result<Value, String> {
