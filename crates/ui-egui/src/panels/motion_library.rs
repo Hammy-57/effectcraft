@@ -3018,8 +3018,26 @@ pub fn start_save(app: &mut EffectcraftApp, p: &Value) -> Result<Value, String> 
     Ok(json!({"saving": id, "job": job}))
 }
 
-/// `motionLibrary.apply`: apply a card from the panel without blocking (`time`: comp seconds,
-/// default the playhead), as a drop on the Timeline does; the panel shows the download.
+/// `motionLibrary.apply` (a drop on the Timeline or viewer, agents; `time`: comp seconds, default
+/// the playhead): an After Effects card this Mac converts (comp, layers, ease, expression) goes
+/// through the Motion Library plug like its Apply button; the rest downloads and imports.
+pub fn apply_command(app: &mut EffectcraftApp, ctx: &egui::Context, p: &Value) -> Result<Value, String> {
+    let id = p.get("id").and_then(Value::as_str).ok_or("missing `id` (a Motion Library card)")?;
+    let lib = local_library(ctx, &app.session.prefs.libraries);
+    let local = app.session.motion_library_local();
+    let card = app.session.motion_library().ok().and_then(|client| library_cards(ctx, &client, &local, &lib).iter().find(|c| c.id == id).cloned());
+    if card.is_some_and(|c| plug_use(&c, &local, &lib).is_some()) {
+        let mut use_p = json!({"op": "use", "id": id});
+        if let Some(t) = p.get("time") {
+            use_p["time"] = t.clone();
+        }
+        app.ui.motion_library.selected = Some(id.to_string());
+        return card_command(app, ctx, &use_p);
+    }
+    start_apply(&mut app.ui.motion_library, p)
+}
+
+/// Apply a card without blocking; the panel shows the download.
 pub fn start_apply(view: &mut ViewState, p: &Value) -> Result<Value, String> {
     let id = p.get("id").and_then(Value::as_str).ok_or("missing `id` (a Motion Library card)")?;
     view.selected = Some(id.to_string());
@@ -4053,7 +4071,8 @@ fn folder_counts<'a>(cards: impl Iterator<Item = &'a Card>) -> BTreeMap<String, 
 
 /// How this Mac uses a card EffectCraft can't apply from files, through the Motion Library's
 /// EffectCraft plug (as the web panel does): `ease` (onto the selected keyframes), `expression`
-/// (onto the selected property), `comp` (converts its After Effects project, then nests it).
+/// (onto the selected property), `comp` (converts its After Effects project, then nests it),
+/// `layers` (converts it, then copies the saved layers into the active comp).
 fn plug_use(card: &Card, local: &LocalIndex, lib: &LocalLib) -> Option<&'static str> {
     if usable(card, local) || !ml_backend().is_some_and(|p| p.is_file()) {
         return None;
@@ -4063,6 +4082,7 @@ fn plug_use(card: &Card, local: &LocalIndex, lib: &LocalLib) -> Option<&'static 
         "Ease" => Some("ease"),
         "Expression" => Some("expression"),
         "Comp" if l.app != "effectcraft" && card.on_mac => Some("comp"),
+        "Layers" if l.app != "effectcraft" && card.on_mac => Some("layers"),
         _ => None,
     }
 }
@@ -4333,11 +4353,17 @@ pub fn card_command(app: &mut EffectcraftApp, ctx: &egui::Context, params: &Valu
             let card = shown.ok_or(format!("no Motion Library card `{id}`"))?;
             let how = plug_use(&card, &local, &lib).ok_or(format!("“{name}”: {}", mac_words(&local).1))?;
             let port = control_port(app)?;
-            let (plug_op, args) = if how == "comp" { ("insert", json!({"id": id, "mode": "comp"})) } else { ("use_asset", json!({"id": id})) };
-            app.ui.status = if how == "comp" { format!("Converting “{name}” from After Effects…") } else { format!("Applying “{name}”…") };
+            // A drop places it at the drop time: the plug inserts at the playhead.
+            if let Some(t) = params.get("time").and_then(Value::as_f64).filter(|t| t.is_finite() && *t >= 0.0) {
+                app.session.execute("time.set", json!({"time": t})).map_err(|e| e.to_string())?;
+            }
+            let converts = matches!(how, "comp" | "layers");
+            let (plug_op, args) = if converts { ("insert", json!({"id": id, "mode": "comp"})) } else { ("use_asset", json!({"id": id})) };
+            app.ui.status = if converts { format!("Converting “{name}” from After Effects…") } else { format!("Applying “{name}”…") };
             let done = match how {
                 "ease" => format!("Applied the ease “{name}” to the selected keyframes"),
                 "expression" => format!("Applied the expression “{name}”"),
+                "layers" => format!("Added the layers of “{name}”"),
                 _ => format!("Inserted “{name}”"),
             };
             spawn_ml_op_with(ctx, move || plug_rpc(port, plug_op, args), FolderChange::None, move |_| done, false);
