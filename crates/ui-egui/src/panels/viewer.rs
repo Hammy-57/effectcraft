@@ -973,8 +973,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Frame.
     let scale = app.viewer_scale(zoom, ppp);
     if !app.playback.playing {
-        // Queue the frame on screen before any prefetch.
-        app.request_frame_urgent(cid, comp.frame_rate.frame_at(app.session.time()), scale);
+        // Queue the frame on screen before any prefetch (exact: not a draft of the cloud's stream).
+        app.request_frame_exact(cid, comp.frame_rate.frame_at(app.session.time()), scale);
     }
     crate::tick_playback(app, &ctx, scale);
     let time = app.session.time();
@@ -1114,7 +1114,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.data_mut(|d| d.remove::<(LayerId, u64)>(pen_id()));
     }
     if finish || app.ui.tool != Tool::Selection {
-        ov::end_free_transform(&ctx);
+        ov::end_free_transform(app);
     }
     if app.layer_controls_visible() {
         // Settings ▸ General ▸ Path Point and Handle Size; Appearance ▸ Use Label Color for
@@ -1312,7 +1312,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     // Free transform box of a path (double-click a path with the Selection tool).
-    let ft = ov::draw_free_transform(app, &ctx, &painter, &map, &paths);
+    let ft = ov::draw_free_transform(app, &painter, &map, &paths);
 
     // Cameras and lights (wireframes) and the 3D view name.
     if comp.has_3d() {
@@ -1489,6 +1489,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Some(_) => egui::CursorIcon::Move,
                 None => egui::CursorIcon::Crosshair,
             },
+            Tool::Selection if ft.as_ref().and_then(|f| f.part_at(hp)).is_some() => match ft.as_ref().and_then(|f| f.part_at(hp)) {
+                Some(ov::FtPart::Handle(i)) => ft.as_ref().map(|f| handle_cursor(&f.quad, i)).unwrap_or(egui::CursorIcon::Move),
+                Some(ov::FtPart::Rotate) => {
+                    crate::local_assets::cursor(&ctx, "rotate", [1, 1]);
+                    egui::CursorIcon::Alias
+                }
+                _ => egui::CursorIcon::Move,
+            },
             _ => {
                 if super::tracker::hit_at(&track_hits, hp).is_some() || key_hits.iter().any(|h| h.pos.distance(hp) < 6.0) {
                     egui::CursorIcon::Move
@@ -1574,8 +1582,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             _ if app.ui.viewer.roi_draw => Some(Gesture::Overlay(ov::Drag::Roi { start: map.to_comp(press), keep: [None, None] })),
             // A region of interest handle: resize it from the opposite corner / edge.
             _ if roi_drag(app, &map, comp_rect, zoom, press).is_some() => roi_drag(app, &map, comp_rect, zoom, press).map(Gesture::Overlay),
-            Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).is_some() => {
-                ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).map(Gesture::Overlay)
+            Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map, mods.command)).is_some() => {
+                ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map, mods.command)).map(Gesture::Overlay)
             }
             Tool::PenConvert | Tool::Pen | Tool::Selection if (tool == Tool::PenConvert || mods.alt) && ov::motion_key_at(&key_hits, press).is_some() => {
                 ov::motion_key_at(&key_hits, press).and_then(|h| {
@@ -1588,6 +1596,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::Key(_) | ov::PenTarget::Tangent) =>
             {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
+            }
+            // Pen or Convert Vertex drag on the motion path between two keys: bend it through the
+            // pointer by those keys' spatial tangents, adding no key (a click adds one).
+            Tool::Pen | Tool::PenConvert
+                if matches!(ov::pen_target(&key_hits, &motion_segments, &motion_frames, press), ov::PenTarget::AddFrame(_) | ov::PenTarget::PathFull) =>
+            {
+                ov::begin_segment_bend(app, &motion_segments, press, map.to_comp(press)).map(Gesture::Overlay)
             }
             Tool::Selection if key_hits.iter().any(|h| h.pos.distance(press) < 6.0) => {
                 ov::begin_key_drag(app, &key_hits, press, map.to_comp(press), mods.shift).map(Gesture::Overlay)
@@ -2131,10 +2146,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("mask.convertVertex", json!({"layer": h.layer.0, "mask": h.mask, "index": h.index}));
                 }
             }
-            Tool::Selection if ft.is_some() && ft.as_ref().and_then(|f| ov::begin_ft_drag(f, pos, &map)).is_none() => {
+            Tool::Selection if ft.as_ref().is_some_and(|f| f.part_at(pos).is_none()) => {
                 // Clicking away from the free-transform box ends it.
-                ov::end_free_transform(&ctx);
+                ov::end_free_transform(app);
             }
+            // A click on the box (no drag) keeps it.
+            Tool::Selection if ft.is_some() => {}
             Tool::ObjectMatte => super::object_matte_tool::apply(app, &ectx, &map, pos, None, mods.shift),
             t if t.puppet_kind().is_some() => {
                 if let Some((h, _)) = super::puppet_tool::hit(&pin_hits, pos) {
@@ -2182,6 +2199,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && !text_owns
         && app.ui.tool == Tool::Selection
         && let Some(pos) = resp.interact_pointer_pos()
+        && ft.as_ref().is_some_and(|f| f.part_at(pos).is_some())
+    {
+        // A double-click on the free-transform box keeps it (its first click may have moved it).
+    } else if resp.double_clicked()
+        && !text_owns
+        && app.ui.tool == Tool::Selection
+        && let Some(pos) = resp.interact_pointer_pos()
         && let Some((l, m)) = vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1)))
     {
         // Double-click a path: all its points selected in a free-transform box (Layer ▸ Mask and
@@ -2191,7 +2215,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let all: Vec<serde_json::Value> = (0..p.sp.vertices.len()).map(|index| json!({"layer": l.0, "mask": m, "index": index})).collect();
             let _ = app.session.execute("mask.selectVertices", json!({"vertices": all}));
         }
-        ov::begin_free_transform(&ctx, l, m);
+        ov::begin_free_transform(app, l, m);
     } else if resp.double_clicked()
         && !text_owns
         && !app.ui.tool.is_pen()

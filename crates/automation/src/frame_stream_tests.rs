@@ -47,7 +47,13 @@ fn project() -> (Arc<Project>, ItemId) {
 
 fn streams() -> (Streams, Receiver<(Down, Vec<u8>)>) {
     let (tx, rx) = channel();
-    let host = Arc::new(StreamHost { render: Arc::new(Fake), cache: Arc::new(LayerCache::new(16 << 20)), log: Arc::new(|_: &str| {}), render_threads: 3 });
+    let host = Arc::new(StreamHost {
+        render: Arc::new(Fake),
+        cache: Arc::new(LayerCache::new(16 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(64 << 20, None)),
+        log: Arc::new(|_: &str| {}),
+        render_threads: 3,
+    });
     (Streams::new(host, tx, 1), rx)
 }
 
@@ -67,6 +73,7 @@ fn start(comp: ItemId, from: f64, to: f64, revision: u64, adaptive: bool) -> Str
         ahead_secs: 10.0,
         adaptive,
         max_size: None,
+        cache: None,
     }
 }
 
@@ -204,7 +211,13 @@ impl FrameRender for Broken {
 fn a_frame_that_cannot_render_ends_the_stream_once() {
     let (p, comp) = project();
     let (tx, rx) = channel();
-    let host = Arc::new(StreamHost { render: Arc::new(Broken), cache: Arc::new(LayerCache::new(16 << 20)), log: Arc::new(|_: &str| {}), render_threads: 3 });
+    let host = Arc::new(StreamHost {
+        render: Arc::new(Broken),
+        cache: Arc::new(LayerCache::new(16 << 20)),
+        frames: Arc::new(crate::frame_cache::FrameCache::new(64 << 20, None)),
+        log: Arc::new(|_: &str| {}),
+        render_threads: 3,
+    });
     let mut s = Streams::new(host, tx, 1);
     s.synced(Some((1, p)));
     s.message(start(comp, 0.0, 2.0, 1, true));

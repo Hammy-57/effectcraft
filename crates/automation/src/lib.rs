@@ -26,6 +26,7 @@ pub mod confine;
 pub mod control_wire;
 pub mod figma_bridge;
 pub mod follow;
+pub mod frame_cache;
 pub mod frame_link;
 pub mod frame_server;
 mod frame_stream;

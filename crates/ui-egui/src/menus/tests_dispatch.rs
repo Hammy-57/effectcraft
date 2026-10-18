@@ -85,6 +85,19 @@ const PINNED_INVOKE: &[&str] = &[
     "window.panelWindow",
     "view.theme.toggle",
     "project.deleteWithoutConfirmation",
+    "motionLibrary.view",
+    "motionLibrary.apply",
+    "motionLibrary.copyName",
+    "motionLibrary.save",
+    "motionLibrary.folder",
+    "motionLibrary.saveSelection",
+    "motionLibrary.card",
+    "motionLibrary.group",
+    "motionLibrary.importFiles",
+    "motionLibrary.refresh",
+    "motionLibrary.curve",
+    "motionLibrary.tool",
+    "viewer.freeTransform",
 ];
 
 /// The ids `menus::frontend` handled (frontend events of engine commands), in the old match order.
@@ -178,7 +191,7 @@ fn handles_exactly_the_pinned_ids() {
         want.sort();
         assert_eq!(got, want, "{stage:?}: the handled ids changed; update PINNED_* only for a deliberate change");
     }
-    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 137);
+    assert_eq!(PINNED_INVOKE.len() + PINNED_FRONTEND.len(), 150);
 }
 
 #[test]

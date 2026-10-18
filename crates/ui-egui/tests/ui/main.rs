@@ -135,12 +135,16 @@ mod ui_script_console;
 mod ui_scriptui;
 #[path = "../ui_scrolling.rs"]
 mod ui_scrolling;
+#[path = "../ui_scrub_expression.rs"]
+mod ui_scrub_expression;
 #[path = "../ui_settings_info.rs"]
 mod ui_settings_info;
 #[path = "../ui_smart_freeze.rs"]
 mod ui_smart_freeze;
 #[path = "../ui_solo_small_tabs.rs"]
 mod ui_solo_small_tabs;
+#[path = "../ui_sound_preview.rs"]
+mod ui_sound_preview;
 #[path = "../ui_source_icons.rs"]
 mod ui_source_icons;
 #[path = "../ui_tabs.rs"]

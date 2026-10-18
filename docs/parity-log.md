@@ -1105,3 +1105,14 @@ before.
   write failures, metadata, invalid serialization, embedded data, warnings and existing output.
   Tests were added but runtime execution is deferred under the fork's daytime policy; no claim
   of visual fidelity or cross-platform acceptance is made. Feature percentages are unchanged.
+
+## Update: motion-path segment bend (17 October 2026)
+
+- Pen (or Convert Vertex) drag on the motion path between two Position keys bends that segment
+  through the pointer: only the first key's out and the second key's in spatial tangent change
+  (`keys.bendSpatialSegment`, one undo step); key count, times, values and temporal ease stay.
+- After Effects parity checked against its documented behaviour (not driven live): a Pen click on
+  a motion path is Add Vertex and adds a keyframe (kept); Convert Vertex click toggles a key
+  between Linear and Auto Bezier, and dragging from a key pulls out its handles (kept). After
+  Effects has no segment drag on motion paths; the bend is an EffectCraft addition (as in
+  Illustrator and Figma). Feature percentages are unchanged.

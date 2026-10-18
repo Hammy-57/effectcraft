@@ -545,6 +545,45 @@ fn motion_path_key_drag_edits_value_and_tangents() {
     assert_eq!(pos(&s).keys[1].value, KV::Vec3([300.0, 100.0, 0.0]));
 }
 
+/// Bend a motion-path segment (Pen drag on the path between two keys): only the out tangent of
+/// the first key and the in tangent of the second change, the layer keeps its two keys, their
+/// times, values and temporal ease, and a merged drag is one undo step.
+#[test]
+fn motion_path_segment_bend_changes_only_tangents() {
+    let mut s = comp();
+    let lid = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    for (t, v) in [(4.77, [100.0, 100.0]), (5.43, [500.0, 100.0])] {
+        s.execute("prop.addKey", json!({"layer": lid, "path": "transform/position", "time": t, "value": [v[0], v[1], 0.0]})).unwrap();
+    }
+    let pos = |s: &Session| layer(s, lid).props.prop("transform/position").unwrap().clone();
+    let before = pos(&s).keys;
+    // Press on the middle of the path, then drag up in two steps of one gesture.
+    let r = s
+        .execute(
+            "keys.bendSpatialSegment",
+            json!({"layer": lid, "path": "transform/position", "time": 4.9, "point": [300, 100], "offset": [0, -40], "merge": "bend"}),
+        )
+        .unwrap();
+    let u = r["u"].as_f64().unwrap();
+    assert!((u - 0.5).abs() < 1e-6, "{u}");
+    s.execute("keys.bendSpatialSegment", json!({"layer": lid, "path": "transform/position", "time": 4.77, "u": u, "offset": [0, -40], "merge": "bend"}))
+        .unwrap();
+    let after = pos(&s).keys;
+    assert_eq!(after.len(), 2, "no key added");
+    for (a, b) in after.iter().zip(&before) {
+        assert_eq!(
+            (a.time, &a.value, &a.in_ease, &a.out_ease, a.in_interp, a.out_interp, a.auto_bezier),
+            (b.time, &b.value, &b.in_ease, &b.out_ease, b.in_interp, b.out_interp, b.auto_bezier)
+        );
+    }
+    assert!(after[0].spatial_out[1] < 0.0 && after[1].spatial_in[1] < 0.0, "{:?} {:?}", after[0].spatial_out, after[1].spatial_in);
+    // The path's middle point went where it was dragged (80 px up).
+    let p = effectcraft_keyframe::spatial_segment_param(&after, 0, [300.0, 20.0]).unwrap();
+    assert!((p - u).abs() < 1e-4, "{p}");
+    s.undo();
+    assert_eq!(pos(&s).keys, before, "one undo step");
+}
+
 #[test]
 fn graph_transform_box_scales_key_times_and_values() {
     let mut s = comp();

@@ -229,6 +229,31 @@ impl Tool {
     }
 }
 
+/// Free Transform Points in the Composition viewer (After Effects: double-click a mask or shape
+/// path with the Selection tool, or Cmd+T with its points selected): a box around the path's
+/// selected points (all of them when none is), turned with them, and its anchor point.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FreeTransform {
+    pub layer: u64,
+    /// The mask's or the shape Path item's uid.
+    pub path: u64,
+    /// The box's rotation in path space (degrees): rotating the points turns the box with them.
+    #[serde(default)]
+    pub angle: f64,
+    /// The anchor point in box coordinates (`[0.5, 0.5]` is the centre, `[0, 0]` the first corner).
+    #[serde(default = "FreeTransform::centre")]
+    pub anchor: [f64; 2],
+}
+
+impl FreeTransform {
+    pub fn new(layer: u64, path: u64) -> Self {
+        FreeTransform { layer, path, angle: 0.0, anchor: Self::centre() }
+    }
+    fn centre() -> [f64; 2] {
+        [0.5, 0.5]
+    }
+}
+
 /// The viewer's Resolution: each composition keeps its own in the project
 /// ([`effectcraft_engine::project::Comp::resolution`], `EffectcraftApp::viewer_res`).
 pub use effectcraft_engine::project::Resolution;
@@ -261,6 +286,8 @@ pub struct ViewerState {
     pub ruler_origin: [f64; 2],
     /// Region of Interest button armed: the next drag in the viewer draws the region.
     pub roi_draw: bool,
+    /// Free Transform Points on a path in the viewer, while it is on.
+    pub free_transform: Option<FreeTransform>,
     /// The pointer is dragging in the viewer this frame (Adaptive Resolution).
     #[serde(skip)]
     pub interacting: bool,
@@ -296,6 +323,7 @@ impl Default for ViewerState {
             proportional_grid: false,
             ruler_origin: [0.0, 0.0],
             roi_draw: false,
+            free_transform: None,
             interacting: false,
             property_interacting: false,
             extended: None,

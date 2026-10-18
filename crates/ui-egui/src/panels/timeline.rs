@@ -1571,29 +1571,42 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let _ = app.session.execute("comp.workArea", json!({key: secs, "merge": "wa-drag"}));
         }
     }
-    // Cache bar (green: cached frames of what the viewer shows: its resolution, view and options).
+    // Cache bar (green: cached frames of what the viewer shows: its resolution, view and options;
+    // lighter green: drafts kept from the cloud's playback stream, CR6c).
     let series = app.shown_series(cid);
     let cached = app.frames.cached_frames(&series);
+    let drafts = app.frames.draft_frames(&series);
     let fd = comp.frame_duration().seconds();
     let cy0 = wa_row.max.y - 4.0;
-    let mut run: Option<(i64, i64)> = None;
-    let draw_run = |a: i64, b: i64| {
+    let mut run: Option<(i64, i64, bool)> = None;
+    let draw_run = |a: i64, b: i64, draft: bool| {
         let x0 = tm.x(a as f64 * fd);
         let x1 = tm.x((b + 1) as f64 * fd);
-        p.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, t.cache_green);
+        p.rect_filled(Rect::from_min_max(pos2(x0, cy0), pos2(x1, cy0 + 2.5)), 0.0, if draft { t.cache_draft } else { t.cache_green });
     };
     for f in cached {
+        let draft = drafts.binary_search(&f).is_ok();
         run = match run {
-            Some((a, b)) if f == b + 1 => Some((a, f)),
-            Some((a, b)) => {
-                draw_run(a, b);
-                Some((f, f))
+            Some((a, b, d)) if f == b + 1 && d == draft => Some((a, f, d)),
+            Some((a, b, d)) => {
+                draw_run(a, b, d);
+                Some((f, f, draft))
             }
-            None => Some((f, f)),
+            None => Some((f, f, draft)),
         };
     }
-    if let Some((a, b)) = run {
-        draw_run(a, b);
+    if let Some((a, b, d)) = run {
+        draw_run(a, b, d);
+    }
+    if !drafts.is_empty() {
+        let strip = Rect::from_min_max(pos2(graph_x0, cy0 - 1.5), pos2(wa_row.max.x, wa_row.max.y));
+        let resp = ui.interact(strip, egui::Id::new("tl-cache-bar"), Sense::hover());
+        let over_draft = resp.hover_pos().is_some_and(|pt| drafts.binary_search(&((tm.t(pt.x) / fd).floor() as i64)).is_ok());
+        if over_draft {
+            resp.on_hover_text(crate::i18n::tr(
+                "Draft frames: kept from the cloud's playback at a lower resolution. They play from this Mac without downloading again; a paused frame renders at full quality.",
+            ));
+        }
     }
     // Disk-cached frames not in RAM (blue), like After Effects.
     if app.session.disk_cache.is_some() || app.frames.remote_disk() {
@@ -2690,8 +2703,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 crate::widgets::context_menu(&name_resp, |ui| prop_menu(ui, &mut app.auto, cid, layer, prop, &mut actions));
                 // Value editors.
                 let value = ectx.value(layer, prop);
+                let raw = prop.value_at(layer.layer_time(ectx.time));
                 let vx = (cw.vx + 4.0).max(name_x + 120.0);
-                let dims = value_editor(app, ui, &lp, layer, prop, &value, pos2(vx, cy), None, &mut actions);
+                let dims = value_editor(app, ui, &lp, layer, prop, &value, &raw, pos2(vx, cy), None, &mut actions);
                 if !dims.is_empty() {
                     dim_hits.push((*uid, dims));
                 }
@@ -3192,6 +3206,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if tresp.clicked() {
         super::timeline_columns::toggle_switches_modes(&mut app.ui.timeline);
     }
+    crate::freeze_hint::show(app, ui, Rect::from_min_max(pos2(graph_x0, rows_rect.min.y), pos2(rect.max.x, footer.min.y)));
     // The frame in the viewer's own time (kept with it while it is cached, as in After Effects),
     // else the last viewer frame's.
     let ms = shown_times.as_ref().map(|s| s.frame.frame_ms).unwrap_or_else(|| app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0));
@@ -3350,6 +3365,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     crate::panels::DragPayload::Files(paths) => {
                         actions.push(("mediaBrowser.import".into(), json!({"paths": paths, "addToComp": true, "index": index, "time": time})))
+                    }
+                    crate::panels::DragPayload::LibraryCard(id) => {
+                        // At the drop time (the playhead when dropped left of the time graph).
+                        actions.push(("motionLibrary.apply".into(), json!({"id": id, "time": time})))
                     }
                     crate::panels::DragPayload::Effect(_) | crate::panels::DragPayload::Property { .. } => {}
                 }
@@ -4109,6 +4128,7 @@ fn value_editor(
     layer: &Layer,
     prop: &Property,
     value: &Value,
+    raw: &Value,
     at: Pos2,
     instance: Option<&[u64]>,
     actions: &mut Vec<(String, serde_json::Value)>,
@@ -4128,6 +4148,7 @@ fn value_editor(
     // selected layers by selection order, the first unchanged and the last by all of it.
     let proportional = scrub && ui.input(|i| widgets::proportional_scrub(i.modifiers));
     let set = |actions: &mut Vec<(String, serde_json::Value)>, v: serde_json::Value| {
+        let v = widgets::scrub_value(prop.has_expression(), raw, value, v, scrub);
         actions.push((
             "prop.set".into(),
             json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub, "proportional": proportional}),

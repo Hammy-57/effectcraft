@@ -15,7 +15,7 @@ use effectcraft_render::cull::NestedKey;
 use effectcraft_render::{EvalCtx, Renderer};
 use effectcraft_time::Tick;
 
-use crate::context::{Enc, GpuImage};
+use crate::context::Enc;
 
 /// Nested comp frames kept for the other instances of their precomp within one frame.
 #[derive(Default)]
@@ -26,7 +26,7 @@ pub(crate) struct Shared {
 
 struct Entry {
     key: NestedKey,
-    img: GpuImage,
+    img: crate::codes::Pixels,
     /// Instances that may still ask for it (other layers of the comp with the same source).
     uses: usize,
 }
@@ -111,7 +111,7 @@ pub(crate) fn first_drawn(r: &Renderer, ctx: &EvalCtx, visible: &[&Layer], size:
 
 /// `walk::render` of a precomp layer's nested comp (`sub` drawing `item` at `t`), shared with
 /// the comp's other instances of `item` that render it identically this frame.
-pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t: Tick) -> Option<GpuImage> {
+pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t: Tick) -> Option<crate::codes::Pixels> {
     let others = ctx.comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Comp { item: i } if i == item)).count().saturating_sub(1);
     let key = if enabled() && others > 0 { sub.nested_key(item, t) } else { None };
     let Some(key) = key else {
@@ -145,6 +145,6 @@ pub(crate) fn nested(e: &mut Enc, ctx: &EvalCtx, sub: &Renderer, item: ItemId, t
     Some(img)
 }
 
-fn texels(img: &GpuImage) -> u64 {
-    u64::from(img.width).saturating_mul(u64::from(img.height))
+fn texels(img: &crate::codes::Pixels) -> u64 {
+    u64::from(img.width()).saturating_mul(u64::from(img.height()))
 }

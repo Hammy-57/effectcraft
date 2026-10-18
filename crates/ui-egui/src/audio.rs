@@ -18,6 +18,9 @@
 //!
 //! **Scrubbing:** Ctrl/Cmd-dragging the current-time indicator plays a short snippet of the mix
 //! at each new frame ([`AudioScrub`], `playback.scrubAudio`), as in After Effects.
+//!
+//! **Hover-to-hear:** a Motion Library Sound card plays its file while the pointer is over it
+//! ([`SoundPreview`], on an output of its own, silent while the Timeline plays).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -118,6 +121,24 @@ impl AudioFeed {
     pub fn clear(&self) {
         if let Ok(mut q) = self.queue.lock() {
             q.clear();
+        }
+    }
+
+    /// Keep only the next `frames` queued, fading them to silence, and start a new epoch: what
+    /// was mixed for the old sound is not queued after it ([`AudioFeed::push_at`]).
+    pub fn fade_out(&self, frames: usize) {
+        if let Ok(mut q) = self.queue.lock() {
+            let keep = frames.min(q.len() / 2);
+            q.truncate(keep * 2);
+            for i in 0..keep {
+                let g = 1.0 - (i + 1) as f32 / keep as f32;
+                for c in 0..2 {
+                    if let Some(v) = q.get_mut(2 * i + c) {
+                        *v *= g;
+                    }
+                }
+            }
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -487,6 +508,191 @@ impl Drop for AudioScrub {
     }
 }
 
+/// Hover-to-hear (Motion Library Sound cards): one decoded sound file on its own output, looping
+/// while the pointer stays on the card, at a gain the panel's SFX preview volume changes while it
+/// plays. A worker decodes the file and tops the feed up a block at a time (gain changes are heard
+/// within [`SOUND_QUEUE_SECONDS`]); stopping fades out what is queued so nothing clicks. The output
+/// stays open for a moment after the pointer leaves, so moving from card to card starts at once.
+pub struct SoundPreview {
+    pub feed: Arc<AudioFeed>,
+    device: Box<dyn AudioDevice>,
+    pub rate: u32,
+    /// What plays (a card id) and its worker's stop flag.
+    playing: Option<(String, Arc<AtomicBool>)>,
+    /// The key whose sound couldn't be decoded (the panel says "Audio unavailable").
+    failed: Arc<Mutex<Option<String>>>,
+    /// Linear gain (f32 bits), read by the worker for every block.
+    gain: Arc<AtomicU32>,
+    /// When it last played (UI seconds): an idle output closes.
+    pub last_used: f64,
+}
+
+/// Decodes a sound at the output's rate (interleaved stereo); runs on the preview's worker.
+pub type SoundDecode = Box<dyn FnOnce(u32) -> Result<Vec<f32>, String> + Send>;
+
+/// Hover sounds play at most this long (longer files are cut, then loop).
+pub const SOUND_PREVIEW_MAX_SECONDS: f64 = 30.0;
+/// Audio queued ahead of the device: how quickly a volume change is heard.
+const SOUND_QUEUE_SECONDS: f64 = 0.08;
+/// Fade when a sound stops or loops around (no clicks).
+const SOUND_FADE_SECONDS: f64 = 0.005;
+
+impl SoundPreview {
+    pub fn open(mut device: Box<dyn AudioDevice>, now: f64) -> Result<SoundPreview, String> {
+        let rate = device.sample_rate().max(8000);
+        let feed = Arc::new(AudioFeed::default());
+        device.start(feed.clone())?;
+        Ok(SoundPreview { feed, device, rate, playing: None, failed: Arc::default(), gain: Arc::new(AtomicU32::new(1.0f32.to_bits())), last_used: now })
+    }
+
+    /// The key playing now.
+    pub fn playing(&self) -> Option<&str> {
+        self.playing.as_ref().map(|(k, _)| k.as_str())
+    }
+
+    /// The key whose sound failed to decode, if any.
+    pub fn failed(&self) -> Option<String> {
+        self.failed.lock().ok().and_then(|f| f.clone())
+    }
+
+    /// Linear gain 0–1 (applies to what is mixed from now on).
+    pub fn set_gain(&self, gain: f32) {
+        let g = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
+        self.gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    /// Play the sound `decode` gives (looping while `looping`) under `key`, replacing what plays.
+    pub fn play(&mut self, key: &str, decode: SoundDecode, looping: bool, now: f64) {
+        self.last_used = now;
+        self.stop();
+        if let Ok(mut f) = self.failed.lock() {
+            *f = None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.playing = Some((key.to_string(), stop.clone()));
+        let epoch = self.feed.epoch.load(Ordering::Acquire);
+        let (feed, gain, failed, rate, key) = (self.feed.clone(), self.gain.clone(), self.failed.clone(), self.rate, key.to_string());
+        let work = move || {
+            let pcm = match decode(rate) {
+                Ok(v) if v.len() >= 2 => v,
+                Ok(_) => fail(&failed, &key, &stop, "the sound is empty".into()),
+                Err(e) => fail(&failed, &key, &stop, e),
+            };
+            if pcm.is_empty() {
+                return;
+            }
+            feed_sound(&feed, epoch, &pcm, rate, &gain, &stop, looping);
+        };
+        // The worker sleeps between blocks: no hover sounds without threads (wasm32).
+        if let Err(e) = std::thread::Builder::new().name("ec-sound-preview".into()).spawn(work) {
+            log::warn!("sound preview: {e}");
+            if let Ok(mut f) = self.failed.lock() {
+                *f = self.playing.take().map(|(k, _)| k);
+            }
+        }
+    }
+
+    /// Stop what plays: what is queued fades out over a few milliseconds.
+    pub fn stop(&mut self) {
+        if let Some((_, stop)) = self.playing.take() {
+            stop.store(true, Ordering::Relaxed);
+            self.feed.fade_out((self.rate as f64 * SOUND_FADE_SECONDS) as usize);
+        }
+    }
+
+    /// Every UI frame while open (Web Audio moves queued samples to the output here).
+    pub fn pump(&mut self) {
+        self.device.pump();
+    }
+}
+
+impl Drop for SoundPreview {
+    fn drop(&mut self) {
+        if let Some((_, stop)) = self.playing.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.device.stop();
+    }
+}
+
+/// A sound that didn't decode: remembered for the panel, nothing plays.
+fn fail(failed: &Mutex<Option<String>>, key: &str, stop: &AtomicBool, e: String) -> Vec<f32> {
+    if !stop.load(Ordering::Relaxed) {
+        log::warn!("sound preview of {key}: {e}");
+        if let Ok(mut f) = failed.lock() {
+            *f = Some(key.to_string());
+        }
+    }
+    Vec::new()
+}
+
+/// The worker's loop: keep [`SOUND_QUEUE_SECONDS`] queued, each block at the gain of the moment,
+/// until stopped (or, not looping, at the end). Blocks queued for an older sound are refused by
+/// the feed's epoch ([`AudioFeed::push_at`]).
+fn feed_sound(feed: &AudioFeed, epoch: u64, pcm: &[f32], rate: u32, gain: &AtomicU32, stop: &AtomicBool, looping: bool) {
+    let frames = pcm.len() / 2;
+    let target = ((rate as f64 * SOUND_QUEUE_SECONDS) as usize).max(256);
+    let block = (target / 4).max(64);
+    let fade = ((rate as f64 * SOUND_FADE_SECONDS) as usize).clamp(1, frames / 2 + 1);
+    let mut pos = 0usize;
+    let mut buf = Vec::with_capacity(block * 2);
+    while !stop.load(Ordering::Relaxed) {
+        if feed.queued_frames() >= target {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        let g = f32::from_bits(gain.load(Ordering::Relaxed));
+        let n = block.min(frames - pos);
+        buf.clear();
+        for i in pos..pos + n {
+            // Looping: fade each pass in and out where it wraps around.
+            let edge = if looping { (i.min(frames - 1 - i) as f32 / fade as f32).min(1.0) } else { 1.0 };
+            let k = g * edge;
+            buf.push(pcm.get(2 * i).copied().unwrap_or(0.0) * k);
+            buf.push(pcm.get(2 * i + 1).copied().unwrap_or(0.0) * k);
+        }
+        if !feed.push_at(epoch, &buf) {
+            break;
+        }
+        pos += n;
+        if pos >= frames {
+            if !looping {
+                break;
+            }
+            pos = 0;
+        }
+    }
+}
+
+/// Decode a sound file's first [`SOUND_PREVIEW_MAX_SECONDS`] at `rate` Hz with FilmCraft's
+/// codecs, in a pool of its own (no frame cache, nothing conformed to disk).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decode_sound_file(path: &str, rate: u32) -> Result<Vec<f32>, String> {
+    let footage = effectcraft_media::probe(path).map_err(|e| e.to_string())?;
+    if !footage.has_audio {
+        return Err("the file has no audio".into());
+    }
+    let secs = footage.duration.seconds();
+    let secs = if secs.is_finite() && secs > 0.0 { secs.min(SOUND_PREVIEW_MAX_SECONDS) } else { return Err("the sound is empty".into()) };
+    let frames = (secs * rate as f64).ceil() as usize;
+    let pcm = effectcraft_media::MediaPool::with_budget(0).audio_samples(&footage, Tick::ZERO, frames, rate);
+    // The pool answers silence when a read fails.
+    if pcm.iter().all(|v| *v == 0.0) {
+        return Err("the sound couldn't be decoded".into());
+    }
+    Ok(pcm)
+}
+
+/// The web has no sound files to read.
+#[cfg(target_arch = "wasm32")]
+pub fn decode_sound_file(_path: &str, _rate: u32) -> Result<Vec<f32>, String> {
+    Err("sound files can't be read here".into())
+}
+
 /// Linear resampling of interleaved stereo from `from` Hz to `n` frames at `to` Hz.
 pub fn resample_stereo(src: &[f32], from: u32, to: u32, n: usize) -> Vec<f32> {
     resample_stereo_at(src, from, to, n, 0.0)
@@ -803,6 +1009,121 @@ mod tests {
         playback.feed.pull(&mut out);
         assert_eq!(out, [0.5; 8]);
         playback.stop();
+    }
+
+    /// An output that keeps the feed it is given.
+    #[derive(Clone, Default)]
+    struct Kept(Arc<Mutex<Option<Arc<AudioFeed>>>>);
+
+    impl AudioDevice for Kept {
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn start(&mut self, feed: Arc<AudioFeed>) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(feed);
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    fn wait_for(what: &str, ok: impl Fn() -> bool) {
+        let t = std::time::Instant::now();
+        while !ok() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn sound_preview_loops_at_its_gain_and_fades_out_when_stopped() {
+        let mut sp = SoundPreview::open(Box::new(Kept::default()), 0.0).unwrap();
+        let feed = sp.feed.clone();
+        sp.set_gain(0.5);
+        // 1000 frames of a constant 0.8, looping.
+        sp.play("a", Box::new(|rate| if rate == 48_000 { Ok(vec![0.8; 2000]) } else { Err(format!("rate {rate}")) }), true, 0.0);
+        assert_eq!(sp.playing(), Some("a"));
+        wait_for("three passes", || feed.queued_frames() >= 3000);
+        let mut out = vec![0.0f32; 6000];
+        feed.pull(&mut out);
+        // At the gain; each pass fades in and out where it wraps (no clicks).
+        assert!((out[1000] - 0.4).abs() < 1e-6, "{}", out[1000]);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[2000], 0.0, "the second pass starts faded in");
+        assert!((out[2500] - 0.4).abs() < 1e-6);
+        // A new volume is heard once what's queued has played.
+        sp.set_gain(1.0);
+        let mut drain = vec![0.0f32; feed.queued_frames() * 2 + 2048];
+        feed.pull(&mut drain);
+        wait_for("louder blocks", || feed.queued_frames() >= 2000);
+        let mut out = vec![0.0f32; 4000];
+        feed.pull(&mut out);
+        assert!(out.iter().any(|v| (v - 0.8).abs() < 1e-6), "the new gain plays");
+        // Stopping keeps only a short fade of what's queued; the worker queues nothing more.
+        sp.stop();
+        assert!(sp.playing().is_none());
+        let fade = (48_000.0 * SOUND_FADE_SECONDS) as usize;
+        assert!(feed.queued_frames() <= fade);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(feed.queued_frames() <= fade, "nothing queued after the stop");
+        let mut tail = vec![0.0f32; fade * 2];
+        feed.pull(&mut tail);
+        assert!(tail.iter().rev().take(2).all(|v| v.abs() < 1e-6), "faded to silence");
+    }
+
+    #[test]
+    fn sound_preview_reports_a_sound_that_does_not_decode() {
+        let mut sp = SoundPreview::open(Box::new(Kept::default()), 0.0).unwrap();
+        sp.play("bad", Box::new(|_| Err("unsupported".into())), true, 0.0);
+        wait_for("the failure", || sp.failed().as_deref() == Some("bad"));
+        assert_eq!(sp.feed.queued_frames(), 0);
+        // Another sound clears it.
+        sp.play("good", Box::new(|_| Ok(vec![0.5; 200])), false, 0.0);
+        assert!(sp.failed().is_none());
+        wait_for("the good sound", || sp.feed.queued_frames() > 0);
+    }
+
+    /// A 16-bit PCM WAV of a 440 Hz sine (stereo, `secs` long at `rate`).
+    pub(crate) fn sine_wav(path: &std::path::Path, rate: u32, secs: f64, amp: f32) {
+        let n = (rate as f64 * secs) as u32;
+        let mut b = Vec::new();
+        let data = n * 4;
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * 4).to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data.to_le_bytes());
+        for i in 0..n {
+            let v = ((i as f32 / rate as f32 * 440.0 * std::f32::consts::TAU).sin() * amp * 32767.0) as i16;
+            b.extend_from_slice(&v.to_le_bytes());
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decode_sound_file_reads_a_wav_at_the_output_rate() {
+        let dir = std::env::temp_dir().join(format!("ec-sound-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("hit.wav");
+        sine_wav(&wav, 44_100, 0.25, 0.5);
+        let pcm = decode_sound_file(&wav.to_string_lossy(), 48_000).unwrap();
+        assert_eq!(pcm.len(), 12_000 * 2);
+        let peak = pcm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!((peak - 0.5).abs() < 0.02, "peak {peak}");
+        // Not a sound: an error, not a panic or silence.
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "hello").unwrap();
+        assert!(decode_sound_file(&txt.to_string_lossy(), 48_000).is_err());
+        assert!(decode_sound_file(&dir.join("missing.wav").to_string_lossy(), 48_000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

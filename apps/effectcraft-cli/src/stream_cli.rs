@@ -90,7 +90,7 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
     let spans: Vec<Mutex<(f64, f64)>> = (0..n).map(|_| Mutex::new((0.0, 0.0))).collect();
     let next = AtomicUsize::new(0);
     let warm = Instant::now();
-    if let Ok((r, _)) = render.render(&RenderJob { project: &project, comp, time: rate.tick_of(first), opts, cache: &cache }) {
+    if let Ok((r, _)) = render.render(&RenderJob { project: &project, comp, time: rate.tick_of(first), opts, cache: &cache, times: None }) {
         drop(r);
     }
     println!("render: first (cold) frame {:.0} ms", ms(warm));
@@ -106,7 +106,7 @@ pub fn bench(args: &Args) -> Result<(), Failure> {
                     }
                     let time = rate.tick_of(first + i as i64);
                     let began = t0.elapsed().as_secs_f64();
-                    let out = render.render(&RenderJob { project: &project, comp, time, opts, cache: &cache });
+                    let out = render.render(&RenderJob { project: &project, comp, time, opts, cache: &cache, times: None });
                     if let Some(sp) = spans.get(i)
                         && let Ok(mut g) = sp.lock()
                     {
@@ -364,6 +364,7 @@ pub fn test(args: &Args) -> Result<(), Failure> {
         ahead_secs: args.num("--ahead").map_err(Failure::Usage)?.unwrap_or(4.0) as f32,
         adaptive: !args.flag("--fixed"),
         max_size: max_side.map(|m| [m, m]),
+        cache: None,
     });
     client.send(Up::Msg { msg, want: Want::default(), urgent: false }, vec![]);
 

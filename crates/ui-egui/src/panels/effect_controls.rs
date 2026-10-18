@@ -270,6 +270,7 @@ fn prop_row(
         key_navigator(app, ui, p, layer, prop, ectx, r, actions);
     }
     let value = ectx.value(layer, prop);
+    let raw = prop.value_at(layer.layer_time(ectx.time));
     // Keep a shared value column while names and their icons follow the group hierarchy.
     // Extremely deep groups still leave a little name space before their value.
     let vx = (r.min.x + r.width() * 0.48).max(r.min.x + PARAM_NAME_X + 124.0).max(swr.max.x + 40.0);
@@ -298,6 +299,7 @@ fn prop_row(
     // With several layers selected the edit applies to the same effect property of each (#491).
     let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
     let set = |actions: &mut Actions, v: serde_json::Value| {
+        let v = widgets::scrub_value(prop.has_expression(), &raw, &value, v, scrub);
         actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub})))
     };
     let twirl_open = |app: &mut EffectcraftApp, ui: &mut egui::Ui| {

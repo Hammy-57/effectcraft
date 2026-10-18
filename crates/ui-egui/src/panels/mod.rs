@@ -24,6 +24,8 @@ pub enum DragPayload {
     Property { layer: u64, prop: u64 },
     /// Files from the Media Browser (import; into the timeline: import and add).
     Files(Vec<String>),
+    /// A Motion Library card id (applied where it is dropped).
+    LibraryCard(String),
 }
 
 /// Layers carried by a Project item drag. Dragging a selected item uses the
