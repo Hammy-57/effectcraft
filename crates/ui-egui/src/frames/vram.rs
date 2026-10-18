@@ -25,6 +25,11 @@ use effectcraft_gpu::Gpu;
 /// Frame working budget on a discrete GPU whose video memory is unknown.
 pub(crate) const UNKNOWN_VRAM_BUDGET: u64 = 2 << 30;
 
+/// Most GPU frames at once on a card with `total` bytes of video memory: one per GiB, at least 2.
+fn frames_for_card(total: u64) -> usize {
+    usize::try_from(total >> 30).unwrap_or(usize::MAX).max(2)
+}
+
 /// Measure the device at most this often (it walks every allocation).
 const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -119,6 +124,12 @@ impl Gate {
             None => (UNKNOWN_VRAM_BUDGET as f64 / per) as usize,
         }
         .clamp(1, threads.max(1));
+        // A heavy frame took about 1 GiB: never more frames at once than the card has GiB (the
+        // adaptive cap learns from light stretches of the comp, and a heavy one after them
+        // filled an 8 GB laptop card with 16 frames and lost the device, closing the window).
+        if let Some(m) = vram {
+            n = n.min(frames_for_card(m.total));
+        }
         if self.measurable.load(Ordering::Acquire) != 2 {
             // One more frame at once for each one finished, from two.
             n = n.min(self.finished.load(Ordering::Acquire).saturating_add(2));
@@ -259,6 +270,15 @@ mod tests {
             g.out_of_memory();
         }
         assert_eq!(g.ceiling(), 1);
+    }
+
+    #[test]
+    fn a_card_runs_at_most_one_gpu_frame_per_gib_of_video_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(frames_for_card(8 * GIB), 8, "an 8 GB laptop card crashed with 16 at once");
+        assert_eq!(frames_for_card(24 * GIB), 24);
+        assert_eq!(frames_for_card(GIB / 2), 2, "at least two");
+        assert_eq!(frames_for_card(0), 2);
     }
 
     #[test]

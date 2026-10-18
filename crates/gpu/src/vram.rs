@@ -28,7 +28,10 @@ pub fn memory_budget_thresholds() -> wgpu::MemoryBudgetThresholds {
 fn creation_percent() -> u8 {
     static PERCENT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        let Some(cap) = std::env::var(VRAM_CAP_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| *mb > 0) else { return 90 };
+        let Some(cap) = std::env::var(VRAM_CAP_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| *mb > 0) else {
+            // No cap asked for: leave the card room (see `default_percent`).
+            return card_free_mib().map_or(90, default_percent);
+        };
         match card_free_mib() {
             Some(free) => {
                 let percent = cap_percent(cap, free);
@@ -41,6 +44,14 @@ fn creation_percent() -> u8 {
             }
         }
     })
+}
+
+/// The share of the driver's budget resources may take on a card with `free` MiB free: 90 %, but
+/// at least 1.5 GiB stay free on a small card (the window, the driver and other programs share
+/// it; an 8 GB laptop card lost its device to out-of-memory at 90 %), never below 50 %.
+fn default_percent(free: u64) -> u8 {
+    let reserve = (free / 10).max(1536);
+    u8::try_from((free.saturating_sub(reserve).saturating_mul(100) / free.max(1)).clamp(50, 90)).unwrap_or(90)
 }
 
 /// `cap` MiB as a whole percentage of `free` MiB, 1 to 90.
@@ -226,6 +237,15 @@ mod tests {
         assert_eq!(cap_percent(100, 24576), 1, "at least 1 %");
         assert_eq!(cap_percent(50_000, 24576), 90, "never above the default");
         assert_eq!(cap_percent(1, 0), 90);
+    }
+
+    #[test]
+    fn a_small_card_keeps_a_reserve_free() {
+        assert_eq!(default_percent(24576), 90, "a big card keeps a tenth");
+        assert_eq!(default_percent(12288), 87);
+        assert_eq!(default_percent(7351), 79, "1.5 GiB of an 8 GB laptop card stay free");
+        assert_eq!(default_percent(2048), 50, "never below half");
+        assert_eq!(default_percent(0), 50);
     }
 
     #[test]
