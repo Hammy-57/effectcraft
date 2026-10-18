@@ -202,7 +202,8 @@ if [ "$skip" = 0 ]; then
   EFFECTCRAFT_FRAME_TOKEN="$token" EFFECTCRAFT_FRAME_GPU_SLOTS=4 WGPU_BACKEND=vulkan RUST_LOG=info \
     setsid nohup "$cli" serve --gpu --frames "$fp" >/workspace/cloud-serve-$fp.log 2>&1 </dev/null &
   echo $! >"$pidf"; echo "$commit" >"$stampf"
-  for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; ss -ltn 2>/dev/null | grep -q ":$fp " && break; done
+  # A fresh machine builds its GPU kernels first (17 s on an A40): wait up to 90 s while it runs.
+  for i in $(seq 1 90); do sleep 1; ss -ltn 2>/dev/null | grep -q ":$fp " && break; kill -0 "$(cat "$pidf")" 2>/dev/null || break; done
   ss -ltn 2>/dev/null | grep -q ":$fp " && echo "SERVE started (pid $(cat "$pidf"))" || { echo "ERR serve did not listen on $fp:"; tail -5 /workspace/cloud-serve-$fp.log; exit 4; }
 fi
 # optional idle watchdog: stops the serve process (never the instance) after N minutes without a connected app
@@ -242,6 +243,40 @@ else echo "serve=not running"; fi
 parse_kv() { sed -n "s/^$1=//p" | head -1; }
 
 # ---------- connect ----------
+# Big files with a Google Drive file link in the project's sidecar start downloading on the machine
+# right away, while it is set up and builds (curl, no effectcraft-cli needed). Each lands at its Mac
+# path with the Mac's size and mtime, so the mirror (step 3) finds it up to date. Folder links and
+# anything that fails are left to the mirror.
+drive_pull_early() { # drive_pull_early PROJECT
+  local sidecar="${1%.ecproj}.cloud.json" jobs="" path link id size mtime
+  [ -f "$sidecar" ] || return 0
+  while IFS=$'\t' read -r path link; do
+    id="$(printf '%s' "$link" | sed -n 's#.*/file/d/\([A-Za-z0-9_-]*\).*#\1#p')"
+    [ -n "$id" ] && [ -f "$path" ] || continue
+    read -r size mtime < <(stat -f '%z %m' "$path") || continue
+    jobs+="$id"$'\t'"$size"$'\t'"$mtime"$'\t'"$path"$'\n'
+  done < <(jq -r '.drive // {} | to_entries[] | [.key, .value] | @tsv' "$sidecar" 2>/dev/null)
+  [ -n "$jobs" ] || return 0
+  say "   ☁️  pulling $(printf '%s' "$jobs" | grep -c .) big file(s) from Google Drive on the machine meanwhile"
+  rbash "$(printf '%s' "$jobs" | base64 | tr -d '\n')" <<'EOS' >/dev/null
+rm -rf /tmp/ec-drive-early; mkdir -p /tmp/ec-drive-early; n=0
+printf '%s' "$1" | base64 -d | while IFS=$'\t' read -r id size mtime path; do
+  n=$((n + 1)); st="/tmp/ec-drive-early/$n"
+  if [ "$(stat -c%s "$path" 2>/dev/null)" = "$size" ]; then echo DONE > "$st"; continue; fi
+  echo RUN > "$st"; mkdir -p "$(dirname "$path")"
+  setsid nohup bash -c 'curl -sSL --retry 3 -o "$4.part" "https://drive.usercontent.google.com/download?id=$1&export=download&confirm=t" && [ "$(stat -c%s "$4.part")" = "$2" ] && touch -d "@$3" "$4.part" && mv "$4.part" "$4" && echo DONE > "$5" || { rm -f "$4.part"; echo FAIL > "$5"; }' _ "$id" "$size" "$mtime" "$path" "$st" >/dev/null 2>&1 </dev/null &
+done
+EOS
+}
+drive_pull_wait() { # waits for drive_pull_early's downloads (up to 30 min), then the mirror takes over
+  local waited=0 st
+  while st="$(rssh 'cat /tmp/ec-drive-early/* 2>/dev/null')"; printf '%s' "$st" | grep -q RUN; do
+    [ "$waited" -ge 1800 ] && { say "   ⚠️  Drive downloads still running after 30 min: the mirror takes over"; return 0; }
+    sleep 10; waited=$((waited + 10))
+  done
+  [ -z "$st" ] || say "   ☁️  Drive: $(printf '%s' "$st" | grep -c DONE) arrived$(printf '%s' "$st" | grep -q FAIL && echo ", $(printf '%s' "$st" | grep -c FAIL) failed (the mirror retries)")"
+}
+
 cmd_connect() {
   TARGET=""; SSH_PORT=22; FRAMES_PORT=9878; LOCAL_PORT=""; APP_PORT="${EFFECTCRAFT_CONTROL_PORT:-9877}"; IDLE_MIN=0
   local project="" do_mirror=1
@@ -268,6 +303,7 @@ cmd_connect() {
   local pre; pre="$(rbash <<<"$REMOTE_PREFLIGHT")" || true
   [ -n "$(printf '%s' "$pre" | parse_kv gpu)" ] || die "cannot reach $TARGET or no GPU there: $pre"
   say "   GPU: $(printf '%s' "$pre" | parse_kv gpu), free VRAM $(printf '%s' "$pre" | parse_kv vram_free_mb) / $(printf '%s' "$pre" | parse_kv vram_total_mb) MB, free disk $(printf '%s' "$pre" | parse_kv disk_free_gb) GB"
+  [ "$do_mirror" = 1 ] && [ -n "$project" ] && drive_pull_early "$project"
   # A machine rented without the EffectCraft template (or whose On-start didn't run): set it up
   # here with the same script the template embeds, then check again.
   local provision="$SKILL_SCRIPTS/template/ec-provision.sh"
@@ -326,6 +362,7 @@ EOS
   ensure_library_token
   if [ "$do_mirror" = 1 ]; then
     say "📦 3/5 Mirroring media + fonts (up to 100 MB from this Mac once; bigger files from Google Drive links; Motion Library cards straight from R2)"
+    [ -n "$project" ] && drive_pull_wait
     local cli; cli="$(mac_cli)"
     local mopts=("$TARGET" --ssh-port "$SSH_PORT" --identity "$SSH_KEY")
     if [ -n "$project" ]; then mopts+=(--project "$project")
